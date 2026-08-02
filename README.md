@@ -30,10 +30,17 @@ Then open the repository menu in the top-left, add or clone a repository, select
 press **Pull issues**. Repositories without a GitHub remote can still use local Git
 features.
 
+![Repository selector with add, clone, and remove controls](docs/screenshots/repositories.png)
+
 There is no install or build step; `npm start`, `npm run dry-run`, and `npm test` are
 aliases for the same commands.
 
 ## Screenshots
+
+Issues are pulled on demand and filtered by state, milestone, assignment, or text. Every
+edit in the detail pane stages rather than writing to GitHub.
+
+![Issues view with the detail pane open](docs/screenshots/issues.png)
 
 Issue edits collect in a staging queue showing the exact `gh` command each one will run.
 Nothing reaches GitHub until you press **Push**.
@@ -241,6 +248,8 @@ The `VIBE_GIT_PORT` environment variable can also set the default port.
 5. Select a chat model and, optionally, an embedding model.
 6. Adjust concurrency or other model settings if required.
 7. Return to **Run** and choose an action.
+
+![Assistant settings with endpoint, model, and account state](docs/screenshots/assistant-settings.png)
 
 Only configure an endpoint you trust. Issue bodies, planning documents, and explicitly
 selected file diffs may be sent to that endpoint when Assistant actions run.
