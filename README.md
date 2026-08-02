@@ -33,6 +33,27 @@ features.
 There is no install or build step; `npm start`, `npm run dry-run`, and `npm test` are
 aliases for the same commands.
 
+## Screenshots
+
+Issue edits collect in a staging queue showing the exact `gh` command each one will run.
+Nothing reaches GitHub until you press **Push**.
+
+![Staged issue changes, each showing the gh command it will run](docs/screenshots/staged-queue.png)
+
+The Plan view ranks open issues, explains each ranking, and flags work the project
+implies but no issue covers.
+
+![Plan view with ranked issues and missing-work proposals](docs/screenshots/plan.png)
+
+Changes shows the working tree with per-file selection and a real diff.
+
+![Changes view with a file list and diff](docs/screenshots/changes.png)
+
+The optional Assistant proposes classifications and missing issues as reviewable
+suggestions, never as direct writes.
+
+![Assistant panel proposing new issues](docs/screenshots/assistant.png)
+
 ## Features
 
 ### Repository management
