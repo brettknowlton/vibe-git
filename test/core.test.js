@@ -274,6 +274,33 @@ test('commit summary diffs include only validated selected files', async (t) => 
   await assert.rejects(() => gitOps.summaryDiff(dir, ['excluded-from-status.txt']), /not one of the current changes/);
 });
 
+test('editing a pull request description is validated and intercepted by dry-run', async (t) => {
+  const ex = require('../lib/exec');
+  const prs = require('../lib/prs');
+
+  await assert.rejects(() => prs.edit('.', { number: 'not-a-number', body: 'x' }),
+    /pull request number/);
+  await assert.rejects(() => prs.edit('.', { number: -3, body: 'x' }),
+    /pull request number/);
+
+  ex.setDryRun(true);
+  t.after(() => ex.setDryRun(false));
+
+  const r = await prs.edit('.', { number: 7, body: 'Rewritten description' });
+  assert.equal(r.dryRun, true);
+  assert.equal(r.number, 7);
+  assert.match(r.message, /Would update/);
+
+  const logged = ex.dryLog().at(-1);
+  assert.deepEqual(logged.args.slice(0, 3), ['pr', 'edit', '7']);
+  assert.deepEqual(logged.args.slice(-2), ['--body', 'Rewritten description']);
+
+  /* An empty description must still send --body, otherwise clearing it silently
+     leaves the old text on GitHub. */
+  await prs.edit('.', { number: 7, body: '' });
+  assert.deepEqual(ex.dryLog().at(-1).args.slice(-2), ['--body', '']);
+});
+
 test('removing a tracked repository preserves its local folder and prevents rediscovery', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-git-untrack-'));
   fs.mkdirSync(path.join(dir, '.git'));

@@ -136,9 +136,14 @@ Milestone creation is applied before issue edits that depend on those milestones
 - View the pull request body, author, branches, review state, mergeability, commits,
   changed-file count, additions, deletions, and diff.
 - Open a pull request from the current branch.
+- Edit the description of an existing pull request.
 - Choose the base branch and create a draft pull request.
 - Detect an existing pull request for the current branch.
 - Require the branch to have an upstream before offering pull request creation.
+
+Unlike issue edits, pull request writes are not staged. Creating a pull request and
+saving a description both apply immediately, each behind a two-stage confirm, because
+they act on a single artifact rather than a batch of related metadata changes.
 
 ### Plan view
 

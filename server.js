@@ -416,6 +416,10 @@ const routes = {
     if (!repos.selected.github) throw new HttpError(400, 'This repository has no GitHub remote');
     return prs.create(dir, body);
   }),
+  'POST /api/pr/edit': async (_q, body) => withRepo(async (dir) => {
+    if (!repos.selected.github) throw new HttpError(400, 'This repository has no GitHub remote');
+    return prs.edit(dir, body);
+  }),
 
   'POST /api/queue/update': async (_q, body) => withRepo(async (dir) => {
     const m = await metaFor(dir).catch(() => null);

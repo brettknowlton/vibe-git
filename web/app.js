@@ -1674,7 +1674,20 @@ async function panePrs(p) {
         h('span', { class: 'adds' }, '+' + pr.adds), h('span', { class: 'dels' }, '−' + pr.dels),
         h('span', { class: 'lab' }, pr.files + ' files'),
         h('a', { class: 'btn sm', href: pr.url, target: '_blank', rel: 'noreferrer noopener' }, 'Open on GitHub ↗'))));
-    if (pr.body) wrap.append(h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Description'), h('div', { class: 'body-md' }, pr.body)));
+    /* The description is editable in place. Unlike an issue edit this is not staged —
+       it matches PR creation, which is also a direct write behind a confirm. */
+    const desc = h('textarea', { placeholder: 'No description', style: { minHeight: '150px' } });
+    desc.value = pr.body || '';
+    const saveDesc = arm(h('button', { class: 'btn sm' }, 'Save description'),
+      'Save description', 'Confirm — this is public',
+      async () => {
+        await act(() => api('/api/pr/edit', { number: pr.n, body: desc.value }), 'git');
+        renderPane();
+      });
+    wrap.append(h('div', { class: 'field' },
+      h('span', { class: 'lab' }, 'Description'), desc,
+      h('div', { class: 'acts' }, saveDesc,
+        h('button', { class: 'btn sm', onclick: () => { desc.value = pr.body || ''; } }, 'Revert'))));
     if (pr.commits.length) {
       wrap.append(h('h3', {}, pr.commits.length + ' commits'));
       const list = h('div', { class: 'commits' });
