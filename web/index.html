@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>vibe-git</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🗂</text></svg>">
+<script nonce="/*BOOT_NONCE*/">/*BOOT*/</script>
+</head>
+<body>
+
+<div class="app">
+  <div class="progress" id="progress" hidden><i></i></div>
+
+  <!-- GitHub Desktop's three-panel header: what repo, what branch, what sync state -->
+  <div class="topbar">
+    <button class="tb" id="tb-repo" aria-expanded="false" aria-haspopup="true">
+      <span class="k">Current repository</span>
+      <span class="v" id="tb-repo-v">—</span>
+    </button>
+    <button class="tb" id="tb-branch" aria-expanded="false" aria-haspopup="true">
+      <span class="k">Current branch</span>
+      <span class="v" id="tb-branch-v">—</span>
+    </button>
+    <button class="tb" id="tb-sync" aria-expanded="false" aria-haspopup="true">
+      <span class="k" id="tb-sync-k">Fetch origin</span>
+      <span class="v" id="tb-sync-v">—</span>
+    </button>
+    <div class="tb-right">
+      <span class="dry" id="dry-badge" hidden>Dry run — no writes</span>
+      <span class="led" id="led" title="connection"></span>
+      <span class="lab" id="stamp"></span>
+      <button class="btn sm" id="btn-refresh" title="Reload everything from git and GitHub">Refresh</button>
+      <button class="btn sm" id="btn-ai" aria-expanded="false" aria-controls="ai-panel"
+              title="Assistant — runs alongside whatever else you're doing">Assistant <span id="ai-pip"></span></button>
+    </div>
+  </div>
+
+  <div class="main">
+    <aside class="side">
+      <nav class="nav" id="nav">
+        <button data-view="issues"  aria-current="true">Issues        <span class="count" id="c-issues">—</span></button>
+        <button data-view="plan"    aria-current="false">Plan          <span class="count" id="c-plan">—</span></button>
+        <button data-view="changes" aria-current="false">Changes       <span class="count" id="c-changes">—</span></button>
+        <button data-view="history" aria-current="false">History       <span class="count" id="c-history">—</span></button>
+        <button data-view="prs"     aria-current="false">Pull requests <span class="count" id="c-prs">—</span></button>
+        <button data-view="staged"  aria-current="false">Staged        <span class="count" id="c-staged">0</span></button>
+      </nav>
+      <div class="side-body" id="side-body"></div>
+      <div class="side-foot" id="side-foot"></div>
+    </aside>
+
+    <main class="pane" id="pane">
+      <div class="empty">Starting up…</div>
+    </main>
+
+    <!-- Right rail. Model work is slow, so it lives beside the app rather than taking it over. -->
+    <aside class="rail" id="ai-panel" hidden aria-label="Assistant">
+      <div class="rail-head">
+        <div class="rail-tabs" role="tablist">
+          <button id="ai-tab-run" role="tab" aria-selected="true">Run</button>
+          <button id="ai-tab-set" role="tab" aria-selected="false">Settings</button>
+        </div>
+        <span class="rail-state" id="ai-state"></span>
+        <button class="btn sm" id="ai-close" title="Collapse">✕</button>
+      </div>
+      <div class="rail-body" id="ai-body"></div>
+      <div class="rail-foot" id="ai-foot"></div>
+    </aside>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

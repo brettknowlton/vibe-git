@@ -1,0 +1,14 @@
+{
+  "name": "vibe-git",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A small local GitHub desktop built around issues.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dry-run": "node server.js --dry-run",
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 2,
+  "repo": "brettknowlton/vibe-git",
+  "source": "reviewed example generated with the vibe-git Assistant",
+  "capturedAt": "2026-08-02",
+  "showcase": true,
+  "generated": true,
+  "requestedCount": 6,
+  "baselineNums": [1, 2, 3, 4, 5, 6],
+  "ranked": [
+    {
+      "ns": [1],
+      "tag": "blocks others",
+      "why": "A reproducible development environment gives every later implementation and test task a shared starting point."
+    },
+    {
+      "ns": [5],
+      "tag": "automation",
+      "why": "The CI pipeline turns the test suite into a repeatable project-wide check instead of relying on each contributor to run it manually."
+    },
+    {
+      "ns": [3],
+      "tag": "protect changes",
+      "why": "Coverage for critical modules reduces the risk of expanding the interface and supplies the checks the CI pipeline needs to enforce."
+    },
+    {
+      "ns": [4],
+      "tag": "shared process",
+      "why": "Review guidelines clarify how changes should be evaluated once automated checks are in place."
+    },
+    {
+      "ns": [2],
+      "tag": "adoption",
+      "why": "Public-facing documentation makes the project's workflows discoverable and gives new users a reliable setup path."
+    },
+    {
+      "ns": [6],
+      "tag": "feedback loop",
+      "why": "A feedback mechanism becomes most useful after users can install the project and understand its core workflows."
+    }
+  ],
+  "gaps": []
+}
