@@ -13,7 +13,7 @@ and other self-hosted forges are not supported. GitHub Enterprise Server is unte
 
 ## Quick start
 
-Requires Node.js 18+, Git 2.23+, and [GitHub CLI](https://cli.github.com/) 2.30+
+Requires Node.js 18+, Git 2.23+, and [GitHub CLI](https://cli.github.com/) 2.54+
 authenticated with the `repo` scope (add `read:org` if you assign issues to organization
 members). Check your scopes with `gh auth status`.
 
