@@ -29,6 +29,7 @@
     </button>
     <div class="tb-right">
       <span class="dry" id="dry-badge" hidden>Dry run — no writes</span>
+      <span class="remote" id="remote-badge" hidden></span>
       <span class="led" id="led" title="connection"></span>
       <span class="lab" id="stamp"></span>
       <button class="btn sm" id="btn-refresh" title="Reload everything from git and GitHub">Refresh</button>
@@ -60,6 +61,7 @@
       <div class="rail-head">
         <div class="rail-tabs" role="tablist">
           <button id="ai-tab-run" role="tab" aria-selected="true">Run</button>
+          <button id="ai-tab-chat" role="tab" aria-selected="false">Chat</button>
           <button id="ai-tab-set" role="tab" aria-selected="false">Settings</button>
         </div>
         <span class="rail-state" id="ai-state"></span>

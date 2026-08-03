@@ -37,8 +37,8 @@ aliases for the same commands.
 
 ## Screenshots
 
-Issues are pulled on demand and filtered by state, milestone, assignment, or text. Every
-edit in the detail pane stages rather than writing to GitHub.
+Issues are pulled on demand and filtered by state, milestone, label, assignment, or text.
+Every edit in the detail pane stages rather than writing to GitHub.
 
 ![Issues view with the detail pane open](docs/screenshots/issues.png)
 
@@ -83,7 +83,10 @@ suggestions, never as direct writes.
 - Discard selected changes behind a confirmation step.
 - Amend the most recent commit message.
 - Undo the most recent commit with a soft reset, preserving its changes.
-- Stash changes, restore the latest stash, and inspect conflict counts after merges.
+- Stash changes, and pop or drop any individual stash by name — listed in **Changes**
+  whether the working tree is dirty or clean, since a clean tree is exactly when a stash
+  is the only thing left to restore.
+- Inspect conflict counts after merges.
 - Browse recent commit history with commit metadata, file statistics, and full patches.
 
 File staging is currently whole-file only; per-hunk and per-line staging are not yet
@@ -104,7 +107,9 @@ available.
 ### Issues
 
 - Pull open and closed issues from GitHub on demand.
-- Filter by state, milestone, unassigned status, issue number, or title text.
+- Filter by state, milestone, label, unassigned status, issue number, or title text.
+- Filter to one label from the dropdown, which counts only labels the loaded issues
+  actually use, or by clicking a label on the issue you are reading.
 - View issue state, milestone, labels, assignees, checklist progress, body, and GitHub
   link.
 - Create issues with a body, milestone, labels, and assignees.
@@ -112,8 +117,45 @@ available.
 - Stage comments, close actions, and reopen actions.
 - Choose between GitHub's `completed` and `not planned` close reasons.
 
-Issue data is cached locally so routine Git operations remain fast. Use **Pull issues**
-or **Refresh** when you want the latest GitHub state.
+Issue data is cached locally so routine Git operations remain fast, and the cache
+persists across restarts. Use **Pull issues** or **Refresh** when you want the latest
+GitHub state.
+
+### Finding issues
+
+The filter box is a hybrid search. Plain words match text; a phrase matches meaning, using
+the embeddings that are already cached for classification. Searching a real 114-issue
+tracker for *"player cannot tell what to do first"* returns the onboarding and playtest
+issues, none of which contain any of those words. A `≈` beside a row means it was found by
+meaning rather than by wording, and `#123` is treated as a lookup rather than a search.
+
+Without an embedding model this degrades to text matching rather than disappearing.
+
+- **Related issues** appear on every issue, ranked by similarity — the duplicate you were
+  about to file, before you file it.
+- **Ready** filters to open issues that are not waiting on another open issue. Bodies
+  saying "blocked by #12", "depends on #7 and #9" or "after #4 is done" build the
+  dependency structure; "blocks #33" is the opposite claim and is deliberately not counted.
+- The issue detail shows what an issue is **waiting on**, what it **unblocks**, and what
+  merely references it.
+
+### Working in bulk
+
+Ctrl-click or shift-click rows to select a range, then apply a milestone, add or remove a
+label, assign someone, or stage a close across the whole selection at once. Every bulk
+action produces ordinary staged changes, so a bad sweep is removed from the queue rather
+than undone on GitHub, and issues that already look the way you asked for are skipped
+rather than restaged.
+
+### Keyboard
+
+| Key | Does |
+|---|---|
+| `Ctrl`/`Cmd` + `K` | Command palette — views, repositories, branches, assistant actions, and every issue by meaning |
+| `/` | Focus the search box |
+| `j` / `k` | Move down / up the issue list |
+| `x` | Add or remove the current issue from the selection |
+| `Esc` | Close the palette, or clear the selection |
 
 ### Staged GitHub changes
 
@@ -128,18 +170,23 @@ staging area:
 - Apply changes sequentially and stop at the first failure, leaving the remainder
   staged for review.
 
-Milestone creation is applied before issue edits that depend on those milestones.
+Milestone and label creation are applied before the issue changes that depend on them, so
+a new milestone or label can be staged and used in the same push.
 
 ### Pull requests
 
 - List open, merged, closed, or all pull requests.
 - View the pull request body, author, branches, review state, mergeability, commits,
   changed-file count, additions, deletions, and diff.
-- Open a pull request from the current branch.
+- Open a pull request from the current branch, from **Changes**, from **Pull requests**,
+  or from the command palette.
 - Edit the description of an existing pull request.
-- Choose the base branch and create a draft pull request.
+- Choose the base branch — local branches and branches that exist only on the remote —
+  defaulting to the repository's own default branch rather than a guess at its name.
+- Create a draft pull request.
 - Detect an existing pull request for the current branch.
-- Require the branch to have an upstream before offering pull request creation.
+- Publish an unpushed branch from the pull request form, which a pull request needs
+  before it can be opened.
 
 Unlike issue edits, pull request writes are not staged. Creating a pull request and
 saving a description both apply immediately, each behind a two-stage confirm, because
@@ -157,7 +204,8 @@ editorial guidance:
 - Open real issues directly in the standard issue editor.
 - Identify work described by a plan but not represented by an issue.
 - Stage a new issue from a missing-work proposal.
-- Ignore or restore proposals that should not become issues.
+- Ignore, restore, or permanently delete proposals that should not become issues.
+- Notice when the tracker has moved on since the plan was generated.
 
 Milestones and issues are joined by their exact milestone title; names do not need a
 `Phase N` prefix. Milestone order, due dates, issue membership, checklist progress,
@@ -170,8 +218,47 @@ recommended ordering, rationale, risks, and concrete work implied by the project
 missing from its issue tracker. Proposed gaps include a reviewable issue body and can be
 staged directly from the Plan view.
 
+The dropdown beside the button sets how many entries the plan should hold, from 10 up to
+50, next to a count of how many issues are actually in scope. Only open issues are ranked;
+closed ones are shown to the model by title alone, so that finished work is recognized
+without spending the prompt that the open issues need. On a tracker with dozens of open
+issues, a longer plan is what lets the recommendation reach past the first milestone.
+
+#### Scoping a plan
+
+A plan can cover the whole tracker or one slice of it — a milestone, a label, or both.
+On a shared tracker this is how two people each get a plan about their own work instead
+of one plan that is mostly about someone else's.
+
+Scope is a property of the saved plan, not just of the request that made it, so
+everything downstream respects it: the ranking never reaches outside the slice, proposed
+missing work is placed inside it, and staleness counts only issues that were in it.
+A milestone-scoped plan does not announce itself out of date because an unrelated issue
+was filed elsewhere.
+
+**Update current plan** keeps the scope the plan was built with; **Generate new** adopts
+whatever the dropdowns currently say. The Plan view names the slice it is answering for,
+because a scoped ranking is complete for that slice and silent about everything else.
+
 The generated editorial plan is saved automatically under `~/.config/vibe-git/plans/`;
-you do not need to create or maintain its JSON schema.
+you do not need to create or maintain its JSON schema. When a repository also has a
+reviewed plan checked in under `insights/`, whichever was captured more recently is the
+one displayed.
+
+#### Keeping a plan current
+
+A plan ranks the issues that existed when it was generated, so filing or closing issues
+makes it quietly out of date. vibe-git records the issue numbers a plan was built from and
+compares them against the tracker on every state load. When they diverge:
+
+- A marker appears beside the plan button in the Assistant, and on the Plan tab's counter.
+- The Plan view explains what changed — how many issues were filed, and how many closed.
+- Asking to regenerate offers a choice rather than silently replacing what you have read:
+  **Update current plan** revises it, keeping entries that are still correct and placing
+  what changed; **Generate new** starts over; **Cancel** leaves it alone.
+
+An update sends the existing plan to the model along with the list of what changed, and is
+told to change the least that makes the plan true again.
 
 **Insight files are gitignored by default**, because a plan can contain private
 schedules, unreleased dates, and repository details — including for repositories other
@@ -190,22 +277,78 @@ bands, dates, and completion state are filled in from live GitHub metadata.
 The Assistant works with an Ollama-compatible HTTP endpoint and is disabled until it is
 configured. It can:
 
-- Classify unorganized issues using existing milestone descriptions and labels.
+- Classify unorganized issues by milestone and label, using existing milestone
+  descriptions as the deciding evidence.
+- Nominate a new milestone or label when nothing existing fits, or when it notices a
+  recurring theme the current labels cannot express.
 - Re-check all open issues, including issues that already have milestones.
 - Suggest milestones for work that does not fit the current structure.
 - Suggest missing issues using the tracker and an available planning document.
-- Generate the Plan view's editorial ordering, explanations, risks, and missing-work
-  issue drafts in one action.
+- Generate or update the Plan view's editorial ordering, explanations, risks, and
+  missing-work issue drafts in one action.
+- Answer questions about the repository in a chat panel, looking things up as it goes.
 - Summarize selected working-tree changes into an editable commit-message draft.
 - Use an optional embedding model to retrieve similar issues as classification
   precedents.
+- Sweep the whole tracker for near-duplicate issues, with no model inference at all.
 - Remember ignored suggestions so they are not repeatedly proposed.
 - Unload selected models when they are no longer needed.
 
+#### Duplicate detection
+
+**Find duplicates** compares every issue against every other using the cached embeddings.
+There is no model call, so it finishes in milliseconds and can be run as often as you like.
+
+Two things make it trustworthy rather than noisy:
+
+- **Thresholds are calibrated to your repository, not asserted.** On a real tracker the
+  pairwise similarities ran 0.26–0.84 with a median of 0.49, so a "0.9 means duplicate" rule
+  could never have fired and a "0.55 means related" rule would have matched half the issues.
+  The bar is derived from the distribution each repository actually produces, and the panel
+  tells you what that distribution was.
+- **A series is not a pile of duplicates.** "Art: Inventory Tab — Grimoire" and "Art:
+  Inventory Tab — Quests" score higher than genuine duplicates do, because they are parallel
+  tasks in one series. Pairs with a shared leading phrase and a distinguishing word on each
+  side are discounted, and a group that still surfaces is flagged as one.
+
+Grouping uses complete linkage: every member must resemble every other member. Single
+linkage chains "A is like B, B is like C" into groups that share only a topic.
+
+The action offered is conservative — stage a close on the newer issues with a comment
+pointing at the oldest, which keeps the discussion in one place and is reversible from the
+staged queue right up until you push.
+
+Every action is cancellable. **Cancel** stops the batch and drops the sockets of requests
+already in flight, which matters when a large model is minutes into work you no longer
+want. Because nothing an Assistant action produces is written anywhere, cancelling can
+only ever abandon a proposal.
+
 The generated plan is local editorial data. The Assistant never writes to GitHub
-directly: classifications and missing-work issue drafts must still be reviewed, staged,
-and pushed through the same queue as manual issue changes. Commit summaries only fill
-the existing commit form; they never stage files or create a commit.
+directly: classifications, nominated categories, chat proposals, and missing-work issue
+drafts must still be reviewed, staged, and pushed through the same queue as manual issue
+changes. Commit summaries only fill the existing commit form; they never stage files or
+create a commit.
+
+#### Chat
+
+The **Chat** tab is the open-ended half of the Assistant. It answers with tools rather than
+recall, and can:
+
+- Read issues, one issue in full, milestones, labels, the plan, recent commits, and the
+  state of the working tree.
+- Search for issues resembling a description, semantically when an embedding model is
+  configured and by word overlap otherwise.
+- Propose an issue, an issue edit, a milestone, or a label — each of which becomes a card
+  you stage and push like any other change.
+
+The tools are read-only apart from the `propose_*` family, and those only produce a payload
+for the staged-change queue, which revalidates everything against the repository. There is
+no tool that runs a command or calls the GitHub API.
+
+The conversation lives in the browser tab, not on the server: switching repository or
+pressing **Clear** ends it. Because the model reads issue text that other people can write,
+it is told that titles, bodies, and commit messages are data rather than instructions, and
+everything it says is inserted into the page as text, never as markup.
 
 When available, planning context is read from common project files such as `PLAN.md`,
 `ROADMAP.md`, `TODO.md`, and their `docs/` variants. `README.md` is used as a fallback
@@ -230,6 +373,9 @@ on disk and it can be added again later.
 | `--port N` | Use a loopback port other than `11001` |
 | `--repo PATH` | Select a repository at startup |
 | `--scan DIR` | Add a repository path to the initial repository list |
+| `--tailscale` | Allow tailnet access through `tailscale serve`, for this node's owner |
+| `--allow-user LOGIN` | Admit a specific tailnet login remotely (repeatable) |
+| `--allow-host NAME` | Serve an additional `Host` value (repeatable) |
 
 The `VIBE_GIT_PORT` environment variable can also set the default port.
 
@@ -268,8 +414,12 @@ Application data is stored under:
 ```
 
 This includes the repository list, settings, staged issue queue, generated plans,
-ignored suggestions, and embedding cache. Newly created configuration files use
-owner-only permissions.
+ignored suggestions, the embedding cache, and a local copy of each repository's issues
+and milestones. Newly created configuration files use owner-only permissions.
+
+The issue copy is what the Issues, Plan and Assistant views read, so opening vibe-git
+again does not wait on `gh`; **Pull** refreshes it. It contains issue titles and bodies,
+including those of private repositories, in plain JSON under your home directory.
 
 This path is used on every platform and does not follow `XDG_CONFIG_HOME`, macOS
 `Application Support`, or Windows `AppData` conventions. vibe-git is developed and
@@ -282,13 +432,51 @@ vibe-git has no telemetry. Depending on the action, it communicates only with:
 - GitHub through the authenticated `gh` command; and
 - the Assistant endpoint configured in settings.
 
+## Reaching it from another device (Tailscale)
+
+vibe-git binds to `127.0.0.1` and always will. `--tailscale` does not change the bind
+address — it lets `tailscale serve` proxy in from loopback, and adds an identity check on
+top:
+
+```bash
+node server.js --tailscale
+tailscale serve --bg 11001        # publishes https://<your-node>.ts.net/ to your tailnet
+```
+
+The server prints the URL, the accounts it will admit, and the accounts it will refuse.
+
+**A tailnet is not an authentication boundary.** Tailnets routinely contain other people's
+laptops and phones, and this app runs `git` and `gh` as you. So membership is not enough:
+
+- Requests must arrive from a loopback peer, meaning through the local `tailscale serve`
+  proxy. A remote client that connects directly and claims an identity is refused.
+- Requests must carry `Tailscale-User-Login`, which tailscaled attaches for the
+  authenticated tailnet user and strips if a client tries to send its own.
+- That login must be on an allowlist, which defaults to the account that owns this machine.
+
+Funnel — Tailscale's public-internet mode — carries no identity, so its requests fail the
+same check. The server also refuses to start if Funnel is already enabled.
+
+| Option | Description |
+|---|---|
+| `--tailscale` | Detect this node's name and owner, and admit that owner remotely |
+| `--allow-user <login>` | Admit this tailnet login instead of the detected owner (repeatable) |
+| `--allow-host <name>` | Serve an additional Host value (repeatable) |
+
+A remote session is labelled in the top bar with the account it authenticated as, because a
+window opened from a phone can push to GitHub exactly like the one on your desk.
+
+Without `--tailscale` nothing but loopback is served, exactly as before.
+
 ## Security model
 
 vibe-git can modify repositories and GitHub data, so it is intended for one trusted
 user on a local computer.
 
-- The server binds to `127.0.0.1` only.
+- The server binds to `127.0.0.1` only, including with `--tailscale`.
 - Page and API requests validate `Host` and `Origin` values.
+- Remote access requires a loopback-proxied request carrying an allowlisted Tailscale
+  identity; tailnet membership alone grants nothing.
 - Every API request requires a random token generated at startup.
 - The startup token is injected under a Content Security Policy nonce.
 - External processes use `execFile` with argument arrays and `shell: false`.
@@ -296,6 +484,10 @@ user on a local computer.
 - Branches, issue numbers, labels, milestones, assignees, and changed-file paths are
   validated before use.
 - Untrusted repository and model text is rendered without executable HTML.
+- Assistant tools are read-only; the only tools with an effect produce staged proposals,
+  which are revalidated against the repository before they can be pushed.
+- Repository text quoted to a model is identified as data, so instructions written into an
+  issue body are not treated as instructions to the Assistant.
 - Destructive actions use confirmation steps, and GitHub issue writes use the staging
   queue.
 - Pull is fast-forward only.
@@ -330,7 +522,15 @@ vibe-git reports conflicts but does not provide a conflict-resolution editor.
 
 Check whether the configured model server is using available hardware acceleration and
 whether the selected model fits in available memory. Embedding and classification work
-can also be reduced by lowering Assistant concurrency.
+can also be reduced by lowering Assistant concurrency. Any action that is taking longer
+than it is worth can be stopped with **Cancel**.
+
+### The chat panel answers without looking anything up
+
+Tool calling requires a model that supports it; a model that ignores the tools will answer
+from the conversation alone. Chat also needs more context than the other actions — it asks
+for at least 16k tokens — so a model configured with a small context window may drop tool
+results mid-conversation.
 
 ## Development
 
@@ -343,11 +543,14 @@ server.js       HTTP server, API routing, request guards, and static serving
 lib/exec.js     subprocess boundary, dry-run handling, and shared validators
 lib/git.js      working tree, history, branches, and synchronization
 lib/issues.js   GitHub issue reads and normalization
-lib/plans.js    deterministic milestone matching, plan hydration, and fallback ranking
+lib/plans.js    deterministic milestone matching, plan hydration, drift, and ranking
 lib/prs.js      pull request reads and creation
 lib/queue.js    persistent, validated GitHub issue operation queue
 lib/repos.js    repository discovery, selection, cloning, and local configuration
 lib/llm.js      optional Ollama-compatible Assistant client
+lib/search.js   hybrid search, calibrated similarity, duplicates, dependency structure
+lib/assistant.js  the chat panel's read-only tools and propose-only conversation loop
+lib/jobs.js     cancellable Assistant work
 web/            dependency-free browser interface
 test/           Node test suite
 ```
@@ -360,6 +563,10 @@ test/           Node test suite
   hit GitHub API rate limits, which surface as `gh` errors; wait for the limit to reset.
 - File staging operates on whole files only.
 - Merge conflicts require an external editor.
+- Semantic search, related issues and duplicate detection need an embedding model and a
+  built index; without one, search falls back to text matching and the other two are off.
+- Chat requires a tool-calling model, holds its transcript only in the browser tab, and
+  stops after eight lookups in one turn.
 - Repository creation and publishing are not included.
 - Force-push, submodule, and Git LFS workflows are not included.
 - Pull is fast-forward only by design.

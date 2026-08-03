@@ -5,3 +5,4 @@
 # local unless a maintainer deliberately force-adds a reviewed example.
 insights/*.json
 !insights/brettknowlton__vibe-git.json
+/.claude

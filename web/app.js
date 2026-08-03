@@ -9,10 +9,28 @@
  */
 
 const BOOT = window.__VIBE_GIT__ || {};
+
+/*
+ * This file is served fresh on every reload; server.js is not, because Node loaded it once
+ * at startup. Editing the front-end therefore takes effect immediately while the API behind
+ * it does not, and a new button fails with "No such endpoint" for no visible reason.
+ *
+ * Must match API_VERSION in server.js. Bump both together when routes change.
+ */
+const APP_API = 3;
+const staleServer = () => Number(BOOT.api || 0) !== APP_API;
 let S = null;                 // last server state
 let VIEW = 'issues';
 let SEL = { issue: null, file: null, commit: null };
-const FILTER = { phase: null, milestone: null, q: '', state: 'open', un: false };
+const FILTER = { phase: null, milestone: null, label: null, q: '', state: 'open', un: false, ready: false };
+
+/*
+ * Search is a layer over the filter, not a replacement for it. When it has hits they
+ * constrain and reorder the list; when it does not, the plain substring filter still runs,
+ * so typing never leaves you looking at nothing while a request is in flight.
+ */
+const SEARCH = { q: '', hits: null, mode: null, error: null, busy: false, seq: 0 };
+let DEPS = null;              // dependency structure, refreshed with the issue list
 let CHECKED = new Set();      // files ticked for the next commit
 const COMMIT_DRAFT = { subject: '', body: '' };
 
@@ -22,7 +40,21 @@ function h(tag, props, ...kids) {
   for (const [k, v] of Object.entries(props || {})) {
     if (v == null || v === false) continue;
     if (k === 'class') e.className = v;
-    else if (k === 'style' && typeof v === 'object') Object.assign(e.style, v);
+    /*
+     * Custom properties need setProperty. `Object.assign(el.style, {'--c': …})` looks like
+     * it works and does nothing at all: CSSStyleDeclaration has no '--c' setter, so the
+     * assignment lands on the JS object and never reaches CSS. Every milestone colour in
+     * the app is passed this way, so all of them were quietly falling back to their
+     * defaults — the plan's rank gutters were all --p0, the milestone dots had no
+     * background, and the timeline bands lost their order entirely.
+     */
+    else if (k === 'style' && typeof v === 'object') {
+      for (const [prop, val] of Object.entries(v)) {
+        if (val == null) continue;
+        if (prop.startsWith('--')) e.style.setProperty(prop, String(val));
+        else e.style[prop] = val;
+      }
+    }
     else if (k.startsWith('on') && typeof v === 'function') e.addEventListener(k.slice(2), v);
     else if (k === 'dataset') Object.assign(e.dataset, v);
     else if (v === true) e.setAttribute(k, '');
@@ -33,6 +65,21 @@ function h(tag, props, ...kids) {
     e.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
   }
   return e;
+}
+
+/*
+ * append() for a builder that may decline to build anything.
+ *
+ * The trap is that `el.append(null)` does not skip — it stringifies, so a section that
+ * returns null when it has nothing to show prints the word "null" into the page. h()
+ * already drops nullish children; this is the same rule for the direct-append path.
+ */
+function put(parent, ...nodes) {
+  for (const node of nodes.flat(9)) {
+    if (node == null || node === false) continue;
+    parent.append(node);
+  }
+  return parent;
 }
 
 /* Insights may come from a checked-in JSON file or a local model. Preserve the small
@@ -121,7 +168,7 @@ async function act(fn, refresh) {
     if (r && r.message) toast(r.message, r.ok === false ? 'bad' : 'good');
     const mode = refresh || 'git';
     if (mode === 'queue' && r && r.queue) {
-      if (r.issues) { S.issues = r.issues; S.issuesLoaded = true; S.issuesAt = r.issuesAt; stampNow(); }
+      if (r.issues) { S.issues = r.issues; S.issuesLoaded = true; S.issuesAt = r.issuesAt; S.issuesStored = false; stampNow(); }
       if (r.insights) S.insights = r.insights;
       S.queue = r.queue;
       render();
@@ -164,7 +211,9 @@ async function load(opts) {
     led('ok', 'connected');
     stampNow();
     render();
-    // First sight of a GitHub repo: pull issues once, in the background.
+    // Only when the server has nothing at all — no memory cache and no stored file. Once a
+    // repository has been pulled once, opening it again reads the local copy and waits for
+    // the user to ask for a refresh instead of spending seconds on `gh` at every launch.
     if (S.selected && S.selected.github && !S.issuesLoaded && !S.githubError) pullIssues();
   } catch (e) {
     if (mine !== loadSeq) return;
@@ -183,9 +232,31 @@ function resetRepoUi() {
   SEL = { issue: null, file: null, commit: null, pr: null };
   CHECKED.clear(); COMMIT_DRAFT.subject = ''; COMMIT_DRAFT.body = '';
   PRS = []; prLoaded = false;
-  PROPOSALS = []; SUGGESTIONS = []; MILESTONES = [];
+  PROPOSALS = []; SUGGESTIONS = []; MILESTONES = []; NEW_LABELS = []; DUPES = [];
+  PICKED = new Set(); lastPicked = null; DEPS = null;
+  SEARCH.q = ''; SEARCH.hits = null; SEARCH.mode = null; SEARCH.error = null; SEARCH.busy = false;
   commitSummaryBusy = false; commitSummarySeq++;
   showHandledGaps = false; showHiddenPlan = false;
+  // A conversation is about one repository — its answers would be wrong beside another.
+  CHAT = []; CHAT_TRACE = new Map(); CHAT_PROPOSALS = []; chatDraft = '';
+  planChoice = false; planBannerOff = false;
+  // A milestone or label from the previous repository is not a scope in this one; carrying
+  // it over would reject the next plan request as an unknown milestone.
+  planScope = { milestone: null, label: null };
+  FILTER.label = null;
+}
+
+/* Coarse on purpose: the question a cached list raises is "roughly how stale", not "when". */
+function ago(iso) {
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return '';
+  const mins = Math.max(0, Math.round((Date.now() - then) / 60000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return hours + 'h ago';
+  const days = Math.round(hours / 24);
+  return days + 'd ago';
 }
 
 function stampNow() {
@@ -203,9 +274,10 @@ async function pullIssues() {
   try {
     const r = await api('/api/issues/pull', {});
     S.issues = r.issues; S.truncated = r.truncated;
-    S.issuesLoaded = true; S.issuesAt = r.issuesAt;
+    S.issuesLoaded = true; S.issuesAt = r.issuesAt; S.issuesStored = false;
     if (r.insights) S.insights = r.insights;
     stampNow(); render();
+    loadDeps().then(() => { if (VIEW === 'issues') renderIssueList(); });
     toast(r.message, 'good');
   } catch (e) { toast(e.message, 'bad'); }
   finally { pulling = false; busy(false); renderNav(); }
@@ -220,6 +292,14 @@ function render() {
 /* ── top bar ─────────────────────────────────────────────────────── */
 function renderTop() {
   $('dry-badge').hidden = !S.dryRun;
+  /* Remote sessions look identical to local ones, and they are not: this window can push
+     to GitHub as you from a device that is not this machine. Say so, permanently. */
+  const remote = $('remote-badge');
+  if (remote) {
+    remote.hidden = BOOT.scope !== 'tailnet';
+    remote.textContent = BOOT.user ? 'tailnet · ' + BOOT.user : 'tailnet';
+    remote.title = 'Reached over Tailscale, not from this machine. Pushes still act as your GitHub account.';
+  }
   const sel = S.selected;
   clear($('tb-repo-v')).append(sel ? sel.name : 'No repository',
     sel && sel.github ? h('small', {}, sel.github) : (sel ? h('small', {}, 'local only') : null));
@@ -244,7 +324,10 @@ function renderTop() {
 function renderNav() {
   const open = S.issues.filter(i => i.st === 'OPEN').length;
   $('c-issues').textContent = pulling ? '…' : (S.issuesLoaded ? open : '—');
-  $('c-plan').textContent = S.insights ? S.insights.ranked.length : '—';
+  const plan = $('c-plan');
+  plan.textContent = S.insights ? S.insights.ranked.length : '—';
+  plan.classList.toggle('stale', !!(S.planStatus && S.planStatus.stale));
+  plan.title = S.planStatus && S.planStatus.stale ? driftText(S.planStatus) : '';
   $('c-changes').textContent = S.git ? S.git.status.files.length : '—';
   $('c-history').textContent = S.git ? S.git.log.length : '—';
   const cp = $('c-prs'); if (cp) cp.textContent = prLoaded ? PRS.length : '—';
@@ -252,7 +335,7 @@ function renderNav() {
   q.textContent = S.queue.length;
   q.classList.toggle('hot', S.queue.length > 0);
   const pip = $('ai-pip');
-  if (pip) pip.className = aiBusy ? 'busy'
+  if (pip) pip.className = (aiBusy || chatBusy || commitSummaryBusy) ? 'busy'
     : (!AI || !AI.ok) ? 'bad'
     : (AI.config && AI.config.enabled && AI.config.model) ? 'on' : '';
 
@@ -281,16 +364,67 @@ function renderSide() {
 }
 
 function visibleIssues() {
-  return S.issues.filter(i => {
+  const ranked = SEARCH.hits && SEARCH.q === FILTER.q ? SEARCH.hits : null;
+  const readySet = FILTER.ready && DEPS ? new Set(DEPS.ready) : null;
+  const rows = S.issues.filter(i => {
     if (FILTER.state === 'open' && i.st !== 'OPEN') return false;
     if (FILTER.state === 'closed' && i.st !== 'CLOSED') return false;
     if (FILTER.phase !== null && i.p !== FILTER.phase) return false;
     if (FILTER.milestone === '__none__' && i.ms) return false;
     if (FILTER.milestone && FILTER.milestone !== '__none__' && i.ms !== FILTER.milestone) return false;
+    if (FILTER.label === '__none__' && i.l.length) return false;
+    if (FILTER.label && FILTER.label !== '__none__' && !i.l.includes(FILTER.label)) return false;
     if (FILTER.un && i.a.length) return false;
-    if (FILTER.q && !(i.t.toLowerCase().includes(FILTER.q) || String(i.n).includes(FILTER.q))) return false;
-    return true;
-  }).sort((a, b) => b.n - a.n);
+    if (readySet && !readySet.has(i.n)) return false;
+    if (!FILTER.q) return true;
+    // With search results in hand, membership is the search's call; otherwise substring.
+    if (ranked) return ranked.has(i.n);
+    return i.t.toLowerCase().includes(FILTER.q) || String(i.n).includes(FILTER.q);
+  });
+  // Relevance order while searching, newest-first otherwise.
+  return ranked
+    ? rows.sort((a, b) => (ranked.get(b.n).score - ranked.get(a.n).score) || b.n - a.n)
+    : rows.sort((a, b) => b.n - a.n);
+}
+
+/*
+ * Searching happens on the server because that is where the embeddings live. It is
+ * debounced and sequenced: a slow reply for "che" must never overwrite the results for
+ * "chest", and the box you are typing into is never re-rendered out from under you.
+ */
+let searchTimer = null;
+function queueSearch(query) {
+  clearTimeout(searchTimer);
+  const q = String(query || '').trim();
+  if (q.length < 2) {
+    SEARCH.q = ''; SEARCH.hits = null; SEARCH.mode = null; SEARCH.error = null; SEARCH.busy = false;
+    renderIssueList();
+    return;
+  }
+  SEARCH.busy = true;
+  renderIssueList();
+  searchTimer = setTimeout(async () => {
+    const mine = ++SEARCH.seq;
+    try {
+      const r = await api('/api/issues/search', { q, state: FILTER.state, limit: 60 });
+      if (mine !== SEARCH.seq) return;
+      SEARCH.q = q.toLowerCase();
+      SEARCH.hits = new Map(r.hits.map(h => [h.number, h]));
+      SEARCH.mode = r.mode;
+      SEARCH.error = r.embedError || null;
+    } catch (e) {
+      if (mine !== SEARCH.seq) return;
+      SEARCH.hits = null; SEARCH.error = e.message;
+    } finally {
+      if (mine === SEARCH.seq) { SEARCH.busy = false; renderIssueList(); }
+    }
+  }, 220);
+}
+
+async function loadDeps() {
+  if (!S || !S.issuesLoaded) return;
+  try { DEPS = await api('/api/issues/dependencies'); }
+  catch { DEPS = null; }
 }
 
 function sideIssues(body, foot) {
@@ -303,12 +437,17 @@ function sideIssues(body, foot) {
     h('div', { class: 'filters' },
       (() => {
         const inp = h('input', {
-          type: 'search', placeholder: 'Filter issues…', value: FILTER.q,
+          type: 'search', id: 'issue-search', placeholder: 'Search issues by meaning…', value: FILTER.q,
+          title: 'Plain words match text; a phrase like "shop and house share a wall" matches meaning',
           style: { flex: '1 1 100%', maxWidth: 'none' },
         });
         inp.addEventListener('input', () => {
           FILTER.q = inp.value.toLowerCase().trim();
-          renderIssueList();                    // list only — the input keeps focus
+          queueSearch(inp.value);               // list only — the input keeps focus
+          renderIssueList();
+        });
+        inp.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') { inp.value = ''; FILTER.q = ''; queueSearch(''); renderIssueList(); }
         });
         return inp;
       })(),
@@ -336,6 +475,27 @@ function sideIssues(body, foot) {
         });
         return sel;
       })(),
+      /*
+       * Labels, counted over the issues actually loaded rather than over the repository's
+       * label list — a tracker usually defines far more labels than it uses, and a
+       * dropdown of forty names that mostly select nothing is worse than no dropdown.
+       */
+      (() => {
+        const used = new Map();
+        S.issues.forEach(i => i.l.forEach(name => used.set(name, (used.get(name) || 0) + 1)));
+        const names = [...used.keys()].sort((a, b) => a.localeCompare(b));
+        const sel = h('select', { title: 'Filter by label', style: { flex: '1 1 100%' } },
+          h('option', { value: '', selected: FILTER.label === null }, 'All labels'),
+          h('option', { value: '__none__', selected: FILTER.label === '__none__' }, 'No label'),
+          ...names.map(name => h('option', {
+            value: name, selected: FILTER.label === name,
+          }, name + '  (' + used.get(name) + ')')));
+        sel.addEventListener('change', () => {
+          FILTER.label = sel.value || null;
+          renderIssueList();
+        });
+        return sel;
+      })(),
       (() => {
         const b = h('button', { class: 'btn sm', 'aria-pressed': String(FILTER.un) }, 'Unassigned');
         b.addEventListener('click', () => {
@@ -344,12 +504,27 @@ function sideIssues(body, foot) {
           renderIssueList();
         });
         return b;
+      })(),
+      /* The question a tracker should be able to answer and normally cannot: what can I
+         actually start right now, given what everything else is waiting on. */
+      (() => {
+        const b = h('button', {
+          class: 'btn sm', 'aria-pressed': String(FILTER.ready),
+          title: 'Open issues that are not waiting on another open issue',
+        }, 'Ready');
+        b.addEventListener('click', async () => {
+          FILTER.ready = !FILTER.ready;
+          b.setAttribute('aria-pressed', String(FILTER.ready));
+          if (FILTER.ready && !DEPS) await loadDeps();
+          renderIssueList();
+        });
+        return b;
       })()));
   body.append(bar);
 
+  body.append(h('div', { class: 'bulk-bar', id: 'bulk-bar', hidden: true }));
   const list = h('div', { id: 'issue-list' });
   body.append(list);
-  renderIssueList();
 
   const staged = S.queue.length;
   foot.append(h('div', { style: { display: 'flex', gap: '7px' } },
@@ -363,6 +538,10 @@ function sideIssues(body, foot) {
       ? (S.dryRun ? 'Dry-run push ' : 'Push ') + staged + ' issue change' + (staged === 1 ? '' : 's')
       : 'No issue changes staged'));
   foot.append(h('span', { class: 'lab', id: 'issue-count' }, ''));
+  // Last, not before the footer is built: renderIssueList writes into #issue-count, and
+  // running it first meant the count line stayed blank until some later re-render
+  // happened to fill it in.
+  renderIssueList();
 }
 
 /* Redraws only the rows, so the filter input above keeps focus and caret position. */
@@ -372,28 +551,165 @@ function renderIssueList() {
   clear(list);
   const stagedFor = new Set(S.queue.filter(c => c.payload && c.payload.number).map(c => c.payload.number));
   const rows = visibleIssues();
+  const ranked = SEARCH.hits && SEARCH.q === FILTER.q ? SEARCH.hits : null;
+  const blocked = DEPS ? new Map(DEPS.blocked.map(b => [b.number, b.waitingOn])) : null;
   if (!rows.length) {
     list.append(h('div', { class: 'empty' },
       pulling ? 'Pulling issues…'
-        : (S.issuesLoaded ? 'No issues match those filters.' : 'Issues not pulled yet.')));
+        : SEARCH.busy ? 'Searching…'
+          : (S.issuesLoaded ? 'No issues match those filters.' : 'Issues not pulled yet.')));
   }
   rows.forEach(i => {
+    const hit = ranked && ranked.get(i.n);
+    const waits = blocked && blocked.get(i.n);
     list.append(h('div', {
-      class: 'irow' + (i.st === 'CLOSED' ? ' closed' : ''),
+      class: 'irow' + (i.st === 'CLOSED' ? ' closed' : '') + (isPicked(i.n) ? ' picked' : ''),
       'aria-selected': String(SEL.issue === i.n),
       style: { '--c': pc(i.p), gridTemplateColumns: '52px 1fr auto' },
-      onclick: () => { SEL.issue = i.n; renderIssueList(); renderPane(); },
+      onclick: (e) => {
+        // Modifier-clicks build a selection; a plain click still just opens the issue.
+        if (e.shiftKey || e.ctrlKey || e.metaKey) { togglePick(i.n, e.shiftKey); return; }
+        SEL.issue = i.n; renderIssueList(); renderPane();
+      },
     },
       h('span', { class: 'n' }, '#' + i.n),
       h('span', { class: 't' }, i.t,
-        h('span', { class: 'sub' }, (i.ms || 'no milestone') + (i.a.length ? ' · ' + i.a[0] : ''))),
+        h('span', { class: 'sub' }, (i.ms || 'no milestone') + (i.a.length ? ' · ' + i.a[0] : '') +
+          (waits && waits.length ? ' · waiting on ' + waits.map(n => '#' + n).join(' ') : ''))),
       h('span', { class: 'meta' },
+        hit && hit.why === 'similar meaning'
+          ? h('span', { class: 'why-chip', title: 'matched by meaning, not words' }, '≈') : null,
+        waits && waits.length ? h('span', { class: 'why-chip blocked', title: 'blocked' }, '⛔') : null,
         stagedFor.has(i.n) ? h('span', { class: 'staged-pip', title: 'has staged changes' }) : null,
         i.p != null ? h('span', { class: 'dot', style: { '--c': pc(i.p) }, title: i.ms }) : null)));
   });
   const c = $('issue-count');
-  if (c) c.textContent = rows.length + ' shown · ' + S.issues.length + ' loaded' +
-    (S.issuesLoaded ? '' : ' · not pulled yet');
+  if (c) {
+    const bits = [rows.length + ' shown', S.issues.length + ' loaded'];
+    if (SEARCH.busy) bits.push('searching…');
+    else if (ranked) bits.push(SEARCH.mode === 'hybrid' ? 'text + meaning' : 'text only');
+    if (SEARCH.error) bits.push(SEARCH.error);
+    if (!S.issuesLoaded) bits.push('not pulled yet');
+    // A list restored from disk is real but not current; say which it is and how old.
+    else if (S.issuesStored) bits.push('from local cache' + (S.issuesAt ? ' · ' + ago(S.issuesAt) : ''));
+    if (PICKED.size) bits.push(PICKED.size + ' selected');
+    c.textContent = bits.join(' · ');
+  }
+  renderBulkBar();
+}
+
+/* ── bulk selection ──────────────────────────────────────────────── */
+/*
+ * Triaging 64 issues one click at a time is the actual cost of an issue tracker, and it is
+ * the thing every GUI for GitHub makes you do. Selection here is ordinary list behaviour —
+ * ctrl-click one, shift-click a range — and every bulk action produces ordinary staged
+ * changes, so a bad sweep is removed from the queue rather than undone on GitHub.
+ */
+let PICKED = new Set();
+let lastPicked = null;
+
+const isPicked = (n) => PICKED.has(n);
+
+function togglePick(number, range) {
+  if (range && lastPicked != null) {
+    const order = visibleIssues().map(i => i.n);
+    const from = order.indexOf(lastPicked), to = order.indexOf(number);
+    if (from > -1 && to > -1) {
+      const [lo, hi] = from < to ? [from, to] : [to, from];
+      for (let k = lo; k <= hi; k++) PICKED.add(order[k]);
+    }
+  } else if (PICKED.has(number)) {
+    PICKED.delete(number);
+  } else {
+    PICKED.add(number);
+  }
+  lastPicked = number;
+  renderIssueList();
+}
+
+function clearPicked() { PICKED = new Set(); lastPicked = null; renderIssueList(); }
+
+/* Staging N changes means N validations; one failure must not abandon the rest. */
+async function bulkStage(build, describe) {
+  const numbers = [...PICKED];
+  if (!numbers.length) return;
+  busy(true);
+  let staged = 0; const failures = [];
+  try {
+    for (const number of numbers) {
+      const payload = build(number);
+      if (!payload) continue;
+      try { await api('/api/queue/add', { kind: 'edit', payload }); staged++; }
+      catch (e) { failures.push('#' + number + ': ' + e.message); }
+    }
+    await load();
+    clearPicked();
+    toast(staged
+      ? `Staged ${describe} on ${staged} issue${staged === 1 ? '' : 's'}` +
+        (failures.length ? ` · ${failures.length} skipped` : '')
+      : 'Nothing to stage — ' + (failures[0] || 'they already look like that'),
+    staged ? 'good' : 'bad');
+    if (failures.length) console.warn('bulk staging skipped:\n' + failures.join('\n'));
+  } finally { busy(false); }
+}
+
+function renderBulkBar() {
+  const host = $('bulk-bar');
+  if (!host) return;
+  clear(host);
+  host.hidden = PICKED.size === 0;
+  if (!PICKED.size) return;
+  const gh = S.github || { milestones: [], labels: [], assignable: [] };
+  const picked = S.issues.filter(i => PICKED.has(i.n));
+
+  const menu = (label, items, onPick) => {
+    const sel = h('select', { class: 'bulk-select' },
+      h('option', { value: '' }, label),
+      ...items.map(v => h('option', { value: v }, v)));
+    sel.addEventListener('change', () => { if (sel.value) { onPick(sel.value); sel.value = ''; } });
+    return sel;
+  };
+
+  host.append(
+    h('span', { class: 'lab' }, PICKED.size + ' selected'),
+    menu('Set milestone…', gh.milestones.map(m => m.title),
+      (v) => bulkStage(n => {
+        const issue = S.issues.find(i => i.n === n);
+        return issue && issue.ms === v ? null : { number: n, milestone: v };
+      }, 'milestone → ' + v)),
+    menu('Add label…', gh.labels.map(l => l.name),
+      (v) => bulkStage(n => {
+        const issue = S.issues.find(i => i.n === n);
+        return issue && issue.l.includes(v) ? null : { number: n, addLabels: [v] };
+      }, '+' + v)),
+    menu('Remove label…', gh.labels.map(l => l.name),
+      (v) => bulkStage(n => {
+        const issue = S.issues.find(i => i.n === n);
+        return issue && issue.l.includes(v) ? { number: n, removeLabels: [v] } : null;
+      }, '−' + v)),
+    gh.assignable.length ? menu('Assign…', gh.assignable.slice(0, 24),
+      (v) => bulkStage(n => {
+        const issue = S.issues.find(i => i.n === n);
+        return issue && issue.a.includes(v) ? null : { number: n, addAssignees: [v] };
+      }, 'assign ' + v)) : null,
+    h('button', {
+      class: 'btn sm', title: 'Stage a close for every selected issue',
+      onclick: async () => {
+        const open = picked.filter(i => i.st === 'OPEN');
+        if (!open.length) return toast('None of those are open', 'bad');
+        busy(true);
+        let n = 0;
+        try {
+          for (const issue of open) {
+            try { await api('/api/queue/add', { kind: 'close', payload: { number: issue.n, reason: 'completed' } }); n++; }
+            catch { /* already staged, most likely */ }
+          }
+          await load(); clearPicked();
+          toast('Staged ' + n + ' close' + (n === 1 ? '' : 's'), n ? 'good' : 'bad');
+        } finally { busy(false); }
+      },
+    }, 'Stage close'),
+    h('button', { class: 'btn sm', onclick: () => clearPicked() }, 'Clear'));
 }
 
 function sidePlan(body, foot) {
@@ -414,10 +730,39 @@ function sidePlan(body, foot) {
   foot.append(h('span', { class: 'lab' }, ins.source));
 }
 
+/*
+ * Stashes, listed whether or not the tree is dirty.
+ *
+ * Pop used to sit below the file list, so a clean tree — the one state in which a stash is
+ * the only thing you could possibly want to restore — offered no way to get at it. Each
+ * stash is named and popped or dropped individually rather than assuming stash@{0}.
+ */
+function stashBlock() {
+  const stashes = (S.git && S.git.stashes) || [];
+  if (!stashes.length) return null;
+  const box = h('div', { class: 'stashes' },
+    h('span', { class: 'lab' }, stashes.length + ' stash' + (stashes.length === 1 ? '' : 'es')));
+  stashes.forEach(s => box.append(h('div', { class: 'srow' },
+    h('span', { class: 't', title: s.subject }, s.subject),
+    h('div', { class: 'acts' },
+      h('button', {
+        class: 'btn sm primary', title: 'Restore ' + s.id + ' into the working tree',
+        onclick: () => act(() => api('/api/git/stash', { action: 'pop', ref: s.id }), 'git'),
+      }, 'Pop'),
+      arm(h('button', { class: 'btn sm danger' }, 'Drop'),
+        'Drop', 'Confirm — cannot be undone',
+        () => act(() => api('/api/git/stash', { action: 'drop', ref: s.id }), 'git'))))));
+  return box;
+}
+
 function sideChanges(body, foot) {
   const files = S.git ? S.git.status.files : [];
   if (!files.length) {
     body.append(h('div', { class: 'empty' }, 'No local changes.'));
+    put(body, stashBlock());
+    // A clean tree is the usual moment to open a pull request, so the button has to be
+    // here too — not only on the branch that still has uncommitted work in it.
+    if (S.selected.github) foot.append(newPrButton());
     return;
   }
   const allOn = files.every(f => CHECKED.has(f.path));
@@ -456,12 +801,10 @@ function sideChanges(body, foot) {
     h('button', {
       class: 'btn sm', disabled: st.clean, title: 'Set the changes aside',
       onclick: () => act(() => api('/api/git/stash', { action: 'push' }), 'git'),
-    }, 'Stash'),
-    h('button', {
-      class: 'btn sm', title: 'Restore the most recent stash',
-      onclick: () => act(() => api('/api/git/stash', { action: 'pop' }), 'git'),
-    }, 'Pop stash'));
+    }, 'Stash'));
   foot.append(extras);
+  // Popping is per-stash in stashBlock, so it is the same control in both states.
+  put(foot, stashBlock());
 
   const n = CHECKED.size;
   const subjectInput = h('input', {
@@ -476,11 +819,16 @@ function sideChanges(body, foot) {
   const box = h('div', { class: 'commitbox' },
     subjectInput,
     bodyInput,
-    assistantAvailable() ? h('button', {
-      class: 'btn wide', disabled: !n || commitSummaryBusy,
-      title: n ? 'Draft an editable commit message from the selected changes' : 'Select files first',
-      onclick: () => runCommitSummary([...CHECKED]),
-    }, commitSummaryBusy ? 'Summarizing…' : 'Draft commit message') : null,
+    assistantAvailable() ? (commitSummaryBusy
+      ? h('button', {
+        class: 'btn wide danger', title: 'Stop the model',
+        onclick: () => { const j = COMMIT_JOB; if (j) api('/api/ai/cancel', { jobId: j }).catch(() => {}); },
+      }, h('span', { class: 'spin' }), 'Summarizing — cancel')
+      : h('button', {
+        class: 'btn wide', disabled: !n,
+        title: n ? 'Draft an editable commit message from the selected changes' : 'Select files first',
+        onclick: () => runCommitSummary([...CHECKED]),
+      }, 'Draft commit message')) : null,
     h('button', {
       class: 'btn primary wide', disabled: !n,
       onclick: async () => {
@@ -503,6 +851,9 @@ function sideChanges(body, foot) {
       },
     }, 'Amend last commit message'));
   foot.append(box);
+  // Committing and then opening a pull request is one continuous action, so the button for
+  // the second half belongs next to the first rather than three views away.
+  if (S.selected.github) foot.append(newPrButton());
   if (n) {
     foot.append(arm(h('button', { class: 'btn danger wide' }, 'Discard ' + n + ' file' + (n === 1 ? '' : 's')),
       'Discard ' + n + ' file' + (n === 1 ? '' : 's'), 'Confirm — cannot be undone',
@@ -542,6 +893,12 @@ function sideStaged(body, foot) {
 /* ── main pane ───────────────────────────────────────────────────── */
 function renderPane() {
   const p = clear($('pane'));
+  if (staleServer()) {
+    p.append(h('div', { class: 'banner' },
+      h('b', {}, 'The server is running older code than this page. '),
+      'It was started before the current ', h('code', {}, 'server.js'), ', so anything new here will ' +
+      'fail with “No such endpoint”. Stop it and run ', h('code', {}, 'node server.js'), ' again.'));
+  }
   if (!S.selected) {
     return p.append(h('div', { class: 'empty' }, 'No repository selected. Pick one from the top-left.'));
   }
@@ -579,7 +936,13 @@ function paneIssue(p) {
         i.st === 'OPEN' ? 'open' : 'closed'),
       h('span', { class: 'chip' }, '#' + i.n),
       i.p != null ? h('span', { class: 'chip ph', style: { '--c': pc(i.p) } }, i.ms) : null,
-      ...i.l.map(l => h('span', { class: 'chip' }, l)),
+      // Clicking a label filters the list to it — the "show me only these" question is
+      // asked from the issue you are already looking at, not from the dropdown.
+      ...i.l.map(l => h('button', {
+        class: 'chip tap', title: FILTER.label === l ? 'Clear the label filter' : 'Show only issues labelled ' + l,
+        'aria-pressed': String(FILTER.label === l),
+        onclick: () => { FILTER.label = FILTER.label === l ? null : l; render(); },
+      }, l)),
       ...i.a.map(a => h('span', { class: 'chip' }, '@' + a)),
       i.bx[1] ? h('span', { class: 'chip' }, i.bx[0] + '/' + i.bx[1] + ' done') : null),
     h('div', { class: 't' }, i.t),
@@ -657,7 +1020,60 @@ function paneIssue(p) {
 
   wrap.append(h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Body'),
     h('div', { class: 'body-md' }, i.body || '(empty)')));
+
+  /* Dependency context, straight from the reference edges the pull now keeps. */
+  const waiting = (i.bk || []).filter(n => S.issues.some(x => x.n === n && x.st === 'OPEN'));
+  const waiters = (DEPS && (DEPS.unblocks.find(u => u.number === i.n) || {}).waiters) || [];
+  if (waiting.length || waiters.length || (i.bl || []).length) {
+    const link = (n) => {
+      const other = S.issues.find(x => x.n === n);
+      return h('button', {
+        class: 'btn sm', title: other ? other.t : '',
+        onclick: () => { SEL.issue = n; render(); },
+      }, '#' + n + (other ? ' ' + (other.t.length > 40 ? other.t.slice(0, 40) + '…' : other.t) : ''));
+    };
+    const rows = [];
+    if (waiting.length) rows.push(h('div', { class: 'relrow' },
+      h('span', { class: 'lab' }, 'waiting on'), ...waiting.map(link)));
+    if (waiters.length) rows.push(h('div', { class: 'relrow' },
+      h('span', { class: 'lab' }, 'unblocks'), ...waiters.map(link)));
+    const mentions = (i.bl || []).filter(n => !waiters.includes(n));
+    if (mentions.length) rows.push(h('div', { class: 'relrow' },
+      h('span', { class: 'lab' }, "ref'd by"), ...mentions.map(link)));
+    wrap.append(h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Dependencies'), ...rows));
+  }
+
+  /* Semantically similar issues — the duplicate you were about to file, before you file it. */
+  const relatedBox = h('div', { class: 'field' },
+    h('span', { class: 'lab' }, 'Related issues'),
+    h('div', { class: 'lab', id: 'related-note' }, 'looking…'));
+  wrap.append(relatedBox);
   p.append(wrap);
+  loadRelated(i.n, relatedBox);
+}
+
+async function loadRelated(number, box) {
+  try {
+    const r = await api('/api/issues/related?number=' + encodeURIComponent(number));
+    if (SEL.issue !== number) return;              // the user moved on while we asked
+    const note = box.querySelector('#related-note');
+    if (!note) return;
+    if (!r.related.length) {
+      note.textContent = 'nothing similar in this tracker';
+      return;
+    }
+    note.remove();
+    r.related.forEach(rel => box.append(h('div', {
+      class: 'relhit' + (rel.state === 'OPEN' ? '' : ' closed'),
+      onclick: () => { SEL.issue = rel.number; render(); },
+    },
+      h('span', { class: 'n' }, '#' + rel.number),
+      h('span', { class: 't' }, rel.title),
+      h('span', { class: 'sim', title: 'cosine similarity' }, Math.round(rel.score * 100) + '%'))));
+  } catch {
+    const note = box.querySelector('#related-note');
+    if (note) note.textContent = 'similarity needs an embedding model and a built index';
+  }
 }
 
 function paneNewIssue(p) {
@@ -763,6 +1179,41 @@ function panePlan(p) {
     h('p', { style: { color: 'var(--fg-mid)', margin: '0 0 16px', maxWidth: '62ch' } },
       'Ranked against ', h('i', {}, ins.source), '. Actions here stage changes — nothing reaches GitHub until you push.'));
 
+  /* A scoped plan answers for a slice of the tracker. Saying which one is not decoration:
+     the ranking below is complete for that slice and silent about everything else, and a
+     reader who assumes otherwise concludes the rest of the project has nothing left. */
+  if (ins.scopeText) {
+    wrap.append(h('div', { class: 'banner', style: { marginBottom: '16px' } },
+      h('b', {}, 'Scoped plan. '),
+      'This covers ' + ins.scopeText + ' — ' + ins.scopeOpen + ' open issue' +
+        (ins.scopeOpen === 1 ? '' : 's') + '. Work outside it is not ranked here.',
+      h('div', { class: 'acts', style: { marginTop: '8px' } },
+        h('button', {
+          class: 'btn sm', disabled: aiBusy || !assistantAvailable(),
+          title: 'Generate a plan across every milestone and label',
+          onclick: () => { planScope = { milestone: null, label: null }; runPlan('new'); },
+        }, 'Plan the whole tracker'))));
+  }
+
+  /* The plan ranks the issues that existed when it was made. Say so the moment that stops
+     being true, rather than letting a confident-looking order quietly go stale. */
+  const drift = (S.planStatus && S.planStatus.stale && !planBannerOff) ? S.planStatus : null;
+  if (drift) {
+    wrap.append(h('div', { class: 'banner warn', style: { marginBottom: '16px' } },
+      h('b', {}, 'The tracker moved on. '), driftText(drift), ' ',
+      h('div', { class: 'acts', style: { marginTop: '8px' } },
+        h('button', {
+          class: 'btn sm primary', disabled: aiBusy || !assistantAvailable(),
+          title: assistantAvailable() ? 'Keep what is still right; place what changed' : 'Turn the assistant on to update the plan',
+          onclick: () => runPlan('update'),
+        }, aiBusy ? 'Working…' : 'Update plan'),
+        h('button', {
+          class: 'btn sm', disabled: aiBusy || !assistantAvailable(),
+          onclick: () => runPlan('new'),
+        }, 'Generate new'),
+        h('button', { class: 'btn sm', onclick: () => { planBannerOff = true; renderPane(); } }, 'Dismiss'))));
+  }
+
   const p0 = ins.phases[0];
   const stats = [
     p0 ? h('div', { class: 'stat hot' }, h('span', { class: 'lab' }, 'Next milestone due'),
@@ -773,7 +1224,9 @@ function panePlan(p) {
       ? h('div', { class: 'stat' }, h('span', { class: 'lab' }, 'Est. hours left'),
         h('span', { class: 'v' }, '~' + Math.round(dBeta / 7 * ins.hoursPerWeek / 5) * 5))
       : null,
-    h('div', { class: 'stat' }, h('span', { class: 'lab' }, 'Open'), h('span', { class: 'v num' }, open.length)),
+    h('div', { class: 'stat' },
+      h('span', { class: 'lab' }, ins.scopeText ? 'Open in scope' : 'Open'),
+      h('span', { class: 'v num' }, ins.scopeText ? ins.scopeOpen : open.length)),
     h('div', { class: 'stat' }, h('span', { class: 'lab' }, 'Missing issues'),
       h('span', { class: 'v num' },
         ins.gaps.filter(g => !matchGap(g.t) && !stagedFor(g.t) && !ignoredFor(g.t)).length)),
@@ -922,7 +1375,7 @@ function panePlan(p) {
     if (hit || pending || ign) { handled++; if (!showHandledGaps) return; }
 
     const c = g.p == null ? 'var(--fg-dim)' : pc(g.p);
-    const card = h('div', { class: 'gap' + (hit || pending ? ' filled' : '') });
+    const card = h('div', { class: 'gap' + (hit || pending ? ' filled' : ''), style: { '--c': c } });
     if (hit) card.append(h('div', { class: 'filled-banner' }, 'Filed — #' + hit.n + ' ' + hit.t + ' · verify it covers this'));
     else if (pending) card.append(h('div', { class: 'filled-banner' }, 'Staged — pushes as “' + pending.payload.title + '”'));
     else if (ign) card.append(h('div', { class: 'filled-banner', style: { color: 'var(--fg-dim)', borderColor: 'var(--fg-dim)' } }, 'Ignored'));
@@ -942,14 +1395,8 @@ function panePlan(p) {
       }, 'Ignore'));
     } else if (ign) {
       acts.append(h('button', {
-        class: 'btn sm',
-        onclick: async () => {
-          try {
-            const r = await api('/api/ai/unignore', { title: g.t });
-            IGNORED = r.ignored; IGNORED_TITLES = r.ignored.map(x => x.title);
-            toast(r.message, 'good'); await load();
-          } catch (e) { toast(e.message, 'bad'); }
-        },
+        class: 'btn sm', title: 'Remove it from the ignore list so it can be suggested again',
+        onclick: () => forgetIgnored(g.t, false),
       }, 'Un-ignore'));
     }
     if (hit) {
@@ -1098,6 +1545,7 @@ let SUGGESTIONS = [];       // suggested new issues awaiting a click
 let aiBusy = false;
 let commitSummaryBusy = false;
 let commitSummarySeq = 0;
+let COMMIT_JOB = null;
 
 function assistantAvailable() {
   const cfg = AI && AI.config;
@@ -1109,10 +1557,12 @@ async function runCommitSummary(paths) {
   const repoPath = S && S.selected && S.selected.path;
   const requestSeq = ++commitSummarySeq;
   commitSummaryBusy = true;
+  COMMIT_JOB = newJobId();
   renderSide();
   try {
-    const result = await api('/api/ai/commit-summary', { paths });
+    const result = await api('/api/ai/commit-summary', { paths, jobId: COMMIT_JOB });
     if (!S || !S.selected || S.selected.path !== repoPath) return;
+    if (result.cancelled) { toast(result.message, ''); return; }
     COMMIT_DRAFT.subject = result.subject;
     COMMIT_DRAFT.body = result.body || '';
     toast(result.message, 'good');
@@ -1123,6 +1573,7 @@ async function runCommitSummary(paths) {
   } finally {
     if (requestSeq !== commitSummarySeq) return;
     commitSummaryBusy = false;
+    COMMIT_JOB = null;
     if (VIEW === 'changes' && S && S.selected && S.selected.path === repoPath) renderSide();
   }
 }
@@ -1132,6 +1583,7 @@ async function aiStatus() {
   catch (e) { AI = { ok: false, error: e.message, models: [], loaded: [], config: {} }; }
   renderNav();
   if (VIEW === 'changes') renderSide();
+  if (VIEW === 'plan') renderPane();
   return AI;
 }
 
@@ -1154,14 +1606,72 @@ function confChip(c) {
 }
 
 let railOpen = false;
-let RAIL_TAB = 'run';          // 'run' | 'settings'
+let RAIL_TAB = 'run';          // 'run' | 'chat' | 'settings'
 let MILESTONES = [];           // proposed new milestones
+let NEW_LABELS = [];           // labels the classifier nominated
+let DUPES = [];                // near-duplicate clusters awaiting a decision
+let DUPE_SCALE = null;         // this repo's similarity distribution, for honest labelling
+let dupeClosed = true;         // a duplicate of a CLOSED issue is the most useful kind
 let IGNORED = [];              // suggestions previously dismissed
 let showIgnored = false;
 let showHandledGaps = false;
 let showHiddenPlan = false;
 let PRS = [], prState = 'open', prLoaded = false, EDITING = null;
 let IGNORED_TITLES = [];   // titles only, for gap matching
+
+/* Assistant work is cancellable, so each run carries an id the browser mints up front —
+   waiting for the server to name the job would leave its slowest part uncancellable. */
+let AI_JOB = null;             // rail action in flight
+let CHAT_JOB = null;           // conversation turn in flight
+const newJobId = () => (window.crypto && window.crypto.randomUUID
+  ? window.crypto.randomUUID()
+  : 'job-' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+
+let CHAT = [];                 // the conversation, held only in this tab
+let CHAT_TRACE = new Map();    // message index → the lookups that produced it
+let CHAT_PROPOSALS = [];       // propose_* results awaiting a Stage click
+let chatBusy = false;
+let chatDraft = '';
+let planChoice = false;        // the generate / update / cancel prompt is showing
+let planBannerOff = false;
+/*
+ * How many entries the next generated plan should hold. It used to be hardwired to 10,
+ * which on a tracker with 60-odd open issues produced a plan that stopped at the first
+ * milestone and looked like the whole recommendation. The server caps it at 50.
+ */
+let planCount = 15;
+/*
+ * What the next plan should be about. Null on both means the whole tracker.
+ *
+ * The point is a shared tracker: scoping to a milestone or a label gives each person a
+ * plan about their own work instead of one plan mostly about someone else's.
+ */
+let planScope = { milestone: null, label: null };
+
+/*
+ * One place that owns the busy flag, the job id and the cancelled case, so every assistant
+ * action behaves the same: buttons disable, a Cancel appears, and a cancel is reported as
+ * a normal outcome rather than an error.
+ */
+async function runAi(fn) {
+  if (aiBusy) return null;
+  AI_JOB = newJobId();
+  aiBusy = true; busy(true); renderRail(); renderNav();
+  try {
+    const r = await fn(AI_JOB);
+    if (r && r.cancelled) { toast(r.message || 'Cancelled', ''); return null; }
+    if (r && r.message) toast(r.message, 'good');
+    return r;
+  } catch (e) { toast(e.message, 'bad'); return null; }
+  finally { AI_JOB = null; aiBusy = false; busy(false); renderRail(); renderNav(); }
+}
+
+async function cancelAi(which) {
+  const jobId = which === 'chat' ? CHAT_JOB : AI_JOB;
+  if (!jobId) return;
+  try { await api('/api/ai/cancel', { jobId }); }
+  catch (e) { toast(e.message, 'bad'); }
+}
 
 function toggleRail(on) {
   railOpen = on === undefined ? !railOpen : !!on;
@@ -1176,15 +1686,157 @@ function renderRail() {
   const foot = clear($('ai-foot'));
   const cfg = (AI && AI.config) || {};
   $('ai-tab-run').setAttribute('aria-selected', String(RAIL_TAB === 'run'));
+  $('ai-tab-chat').setAttribute('aria-selected', String(RAIL_TAB === 'chat'));
   $('ai-tab-set').setAttribute('aria-selected', String(RAIL_TAB === 'settings'));
   $('ai-state').textContent = !AI ? 'checking…'
     : !AI.ok ? 'unreachable'
-    : aiBusy ? 'working…'
+    : (aiBusy || chatBusy) ? 'working…'
     : (cfg.enabled && cfg.model ? cfg.model.split('/').pop().slice(0, 22) : 'not set up');
 
   if (!AI) { body.append(h('div', { class: 'empty' }, 'Checking endpoint…')); return; }
   if (RAIL_TAB === 'settings') return railSettings(body, foot, cfg);
+  if (RAIL_TAB === 'chat') return railChat(body, foot, cfg);
   return railRun(body, foot, cfg);
+}
+
+/* ── Chat tab ────────────────────────────────────────────────────── */
+/*
+ * The open-ended half of the assistant. The transcript lives here in the tab and is sent
+ * whole with each turn, so there is no session on the server: switching repository or
+ * pressing Clear really does end the conversation.
+ *
+ * Everything the model says is inserted as TEXT, never markup — the same rule the rest of
+ * this file follows for repository content, and it applies doubly to a model that has just
+ * been reading issue bodies other people wrote.
+ */
+function railChat(body, foot, cfg) {
+  if (!cfg.enabled || !cfg.model) {
+    body.append(h('div', { class: 'banner warn' },
+      cfg.enabled ? 'Pick a chat model in Settings.' : 'Assistant is off — turn it on in Settings.'));
+    return;
+  }
+
+  const log = h('div', { class: 'chat' });
+  if (!CHAT.length) {
+    log.append(h('div', { class: 'empty' },
+      'Ask about this repository.\n\nIt can read issues, milestones, labels,\nthe plan and recent commits — and\npropose issues for you to stage.'));
+  }
+  CHAT.forEach((m, idx) => {
+    if (m.role === 'user') return log.append(h('div', { class: 'msg me' }, m.content));
+    const trace = CHAT_TRACE.get(idx);
+    if (trace && trace.length) {
+      log.append(h('div', { class: 'steps' },
+        ...trace.map(t => h('span', { class: 'step' + (t.error ? ' bad' : ''), title: t.error || t.label }, t.label))));
+    }
+    log.append(h('div', { class: 'msg ai' }, m.content));
+  });
+  if (chatBusy) {
+    log.append(h('div', { class: 'msg ai' }, h('span', { class: 'spin' }), 'thinking — it may run a few lookups…'));
+  }
+  body.append(log);
+
+  if (CHAT_PROPOSALS.length) {
+    body.append(h('h3', {}, 'Proposals from this conversation'),
+      h('div', { class: 'lab', style: { marginBottom: '7px' } }, 'nothing is filed until you stage and push'));
+    CHAT_PROPOSALS.forEach(p => body.append(chatProposalCard(p)));
+  }
+
+  if (S && !S.issuesLoaded) {
+    body.append(h('div', { class: 'banner warn' }, 'Issues are not pulled yet, so it cannot see them.'));
+  }
+
+  const ta = h('textarea', {
+    class: 'chat-in', rows: '3', placeholder: 'Ask about this repository…',
+    'aria-label': 'Message the assistant',
+  });
+  ta.value = chatDraft;
+  ta.addEventListener('input', () => { chatDraft = ta.value; });
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  });
+  foot.append(ta, h('div', { class: 'acts' },
+    chatBusy
+      ? h('button', { class: 'btn sm danger', onclick: () => cancelAi('chat') }, 'Cancel')
+      : h('button', { class: 'btn sm primary', onclick: () => sendChat() }, 'Send'),
+    h('button', {
+      class: 'btn sm', disabled: !CHAT.length || chatBusy,
+      onclick: () => { CHAT = []; CHAT_TRACE = new Map(); CHAT_PROPOSALS = []; renderRail(); },
+    }, 'Clear'),
+    h('span', { class: 'lab' }, 'enter sends')));
+
+  // Follow the conversation, the way every chat panel does.
+  const scroller = $('ai-body');
+  if (scroller) requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
+}
+
+function editSummary(p) {
+  const bits = [];
+  if (p.milestone) bits.push('milestone → ' + p.milestone);
+  if (p.addLabels && p.addLabels.length) bits.push('+' + p.addLabels.join(', +'));
+  if (p.removeLabels && p.removeLabels.length) bits.push('−' + p.removeLabels.join(', −'));
+  return bits.join(' · ');
+}
+
+function chatProposalCard(p) {
+  const payload = p.payload || {};
+  return h('div', { class: 'prop', style: { '--c': 'var(--p2)' } },
+    h('div', { class: 'h' }, h('span', { class: 'lab' }, p.type), h('span', { class: 't' }, p.title)),
+    p.kind === 'edit' ? h('div', { class: 'move' }, editSummary(payload)) : null,
+    p.kind === 'create'
+      ? h('div', { class: 'move' }, (payload.milestone || 'no milestone') +
+        (payload.labels && payload.labels.length ? ' · ' + payload.labels.join(', ') : ''))
+      : null,
+    p.rationale ? h('p', { class: 'r' }, p.rationale) : null,
+    ...(p.notes || []).map(n => h('div', { class: 'move' }, n)),
+    payload.body || payload.description
+      ? h('details', {}, h('summary', {}, payload.body ? 'Body' : 'Description'),
+        h('div', { class: 'draft' }, h('pre', {}, payload.body || payload.description)))
+      : null,
+    h('div', { class: 'acts' },
+      h('button', {
+        class: 'btn sm primary',
+        onclick: async () => {
+          await stage(p.kind, payload);
+          CHAT_PROPOSALS = CHAT_PROPOSALS.filter(x => x !== p); renderRail();
+        },
+      }, 'Stage'),
+      h('button', {
+        class: 'btn sm',
+        onclick: () => { CHAT_PROPOSALS = CHAT_PROPOSALS.filter(x => x !== p); renderRail(); },
+      }, 'Skip')));
+}
+
+async function sendChat() {
+  const text = String(chatDraft || '').trim();
+  if (!text || chatBusy) return;
+  CHAT.push({ role: 'user', content: text });
+  chatDraft = '';
+  chatBusy = true; CHAT_JOB = newJobId();
+  busy(true); renderRail(); renderNav();
+  try {
+    const r = await api('/api/ai/chat', {
+      messages: CHAT.map(m => ({ role: m.role, content: m.content })),
+      jobId: CHAT_JOB,
+    });
+    if (r.cancelled) {
+      CHAT.push({ role: 'assistant', content: '(cancelled)' });
+      toast(r.message, '');
+    } else {
+      const at = CHAT.length;
+      CHAT.push({ role: 'assistant', content: r.reply || '(the model returned nothing)' });
+      if (r.trace && r.trace.length) CHAT_TRACE.set(at, r.trace);
+      if (r.proposals && r.proposals.length) CHAT_PROPOSALS = CHAT_PROPOSALS.concat(r.proposals);
+      if (r.truncated) toast('Stopped at the lookup limit — ask something narrower to go further', '');
+    }
+  } catch (e) {
+    CHAT.push({ role: 'assistant', content: '⚠ ' + e.message });
+    toast(e.message, 'bad');
+  } finally {
+    chatBusy = false; CHAT_JOB = null;
+    busy(false); renderRail(); renderNav();
+    const box = document.querySelector('.chat-in');
+    if (box) box.focus();
+  }
 }
 
 /* ── Settings tab ────────────────────────────────────────────────── */
@@ -1207,7 +1859,13 @@ function railSettings(body, foot, cfg) {
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Parallel requests'),
       (() => { const i = h('input', { type: 'number', min: '1', max: '8', value: String(cfg.concurrency || 2) });
         i.addEventListener('change', () => aiSave({ concurrency: Number(i.value) }).catch(e => toast(e.message, 'bad')));
-        return i; })())));
+        return i; })()),
+    h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Context tokens'),
+      (() => { const i = h('input', { type: 'number', min: '2048', step: '2048', value: String(cfg.numCtx || 8192) });
+        i.addEventListener('change', () => aiSave({ numCtx: Number(i.value) }).catch(e => toast(e.message, 'bad')));
+        return i; })(),
+      h('span', { class: 'lab', style: { textTransform: 'none', letterSpacing: '0' } },
+        'Chat always asks for at least 16k, since tool results have to fit alongside the conversation.'))));
 
   if (AI.loaded && AI.loaded.length) {
     body.append(h('h3', {}, 'Loaded in memory'),
@@ -1269,19 +1927,43 @@ function railRun(body, foot, cfg) {
     h('button', { class: 'btn wide', disabled: !ready, onclick: () => runClassify(true) }, 'Re-check all open'),
     h('button', { class: 'btn wide', disabled: aiBusy, onclick: () => runSuggest() }, 'Suggest missing issues'),
     h('button', { class: 'btn wide', disabled: !ready, onclick: () => runMilestones() }, 'Suggest milestones'),
-    h('button', { class: 'btn wide', disabled: !ready, onclick: () => runPlan() }, 'Generate plan + insights'));
+    planButtonRow(ready));
   if (cfg.embedModel) {
     acts.append(h('button', {
       class: 'btn wide', disabled: !ready,
-      onclick: async () => {
-        aiBusy = true; renderRail();
-        try { const r = await api('/api/ai/index', {}); toast(r.message, 'good'); }
-        catch (e) { toast(e.message, 'bad'); }
-        finally { aiBusy = false; renderRail(); }
-      },
+      onclick: () => runAi(jobId => api('/api/ai/index', { jobId })),
     }, 'Build / refresh index'));
+    /* Pure cosine over vectors that already exist — no inference, so it is instant. */
+    acts.append(h('button', {
+      class: 'btn wide', disabled: !ready,
+      title: 'Compare every issue against every other. No model call — uses the cached index.',
+      onclick: async () => {
+        busy(true);
+        try {
+          const r = await api('/api/issues/duplicates', { includeClosed: dupeClosed });
+          DUPES = r.clusters; DUPE_SCALE = r.scale || null;
+          toast(r.message, r.clusters.length ? 'good' : '');
+          renderRail();
+        } catch (e) { toast(e.message, 'bad'); }
+        finally { busy(false); }
+      },
+    }, 'Find duplicates'));
+    acts.append(h('label', { class: 'inline-check' },
+      (() => {
+        const box = h('input', { type: 'checkbox', checked: dupeClosed });
+        box.addEventListener('change', () => { dupeClosed = box.checked; });
+        return box;
+      })(),
+      h('span', { class: 'lab' }, 'compare against closed issues too')));
+  }
+  if (aiBusy) {
+    acts.append(h('button', {
+      class: 'btn wide danger', onclick: () => cancelAi('run'),
+      title: 'Stop the model. Nothing has been staged, so nothing is left half-done.',
+    }, 'Cancel'));
   }
   body.append(acts);
+  if (planChoice) body.append(planChoiceBox());
   body.append(h('div', { class: 'lab', style: { marginTop: '9px', textTransform: 'none', letterSpacing: '0' } },
     'Plan generation saves a local editorial plan and proposes missing issues. Live repository data supplies its dates, milestones, and status.'));
 
@@ -1289,11 +1971,27 @@ function railRun(body, foot, cfg) {
     body.append(h('div', { class: 'banner warn', style: { marginTop: '11px' } }, 'Pull issues first.'));
   }
 
-  const nothing = !PROPOSALS.length && !SUGGESTIONS.length && !MILESTONES.length;
+  const nothing = !PROPOSALS.length && !SUGGESTIONS.length && !MILESTONES.length &&
+    !NEW_LABELS.length && !DUPES.length;
+
+  if (DUPES.length) {
+    body.append(h('h3', {}, 'Possible duplicates'),
+      h('div', { class: 'lab', style: { marginBottom: '7px' } },
+        DUPE_SCALE && DUPE_SCALE.calibrated
+          ? `above ${DUPE_SCALE.p99.toFixed(2)} similarity, where this repo averages ${DUPE_SCALE.median.toFixed(2)}`
+          : 'the oldest issue keeps the history — closing points at it'));
+    DUPES.forEach(cluster => body.append(dupeCard(cluster)));
+  }
 
   if (MILESTONES.length) {
     body.append(h('h3', {}, 'Proposed milestones'));
     MILESTONES.forEach(ms => body.append(milestoneCard(ms)));
+  }
+  if (NEW_LABELS.length) {
+    body.append(h('h3', {}, 'Nominated labels'),
+      h('div', { class: 'lab', style: { marginBottom: '7px' } },
+        'patterns the existing labels cannot express'));
+    NEW_LABELS.forEach(l => body.append(labelCard(l)));
   }
   if (PROPOSALS.length) {
     const changed = PROPOSALS.filter(x => x.changed && !x.error);
@@ -1337,19 +2035,226 @@ function railRun(body, foot, cfg) {
       const box = h('div', { style: { maxHeight: '190px', overflowY: 'auto' } });
       if (!IGNORED.length) box.append(h('div', { class: 'lab' }, 'nothing ignored yet'));
       IGNORED.forEach(g => box.append(h('div', { class: 'ign' },
-        h('span', { class: 't', title: g.title }, g.title),
+        h('span', { class: 't', title: (g.reason ? g.title + ' — ' + g.reason : g.title) }, g.title),
         h('button', {
-          class: 'btn sm',
-          onclick: async () => {
+          class: 'btn sm', title: 'Forget this entry. The idea can be suggested again.',
+          onclick: () => forgetIgnored(g.title),
+        }, 'Delete'))));
+      foot.append(box);
+      if (IGNORED.length) {
+        foot.append(arm(h('button', { class: 'btn wide danger' }, 'Delete all ' + IGNORED.length),
+          'Delete all ' + IGNORED.length, 'Confirm — the list is emptied',
+          async () => {
             try {
-              const r = await api('/api/ai/unignore', { title: g.title });
+              const r = await api('/api/ai/ignored/clear', {});
               IGNORED = r.ignored; toast(r.message, 'good'); await load(); renderRail();
             } catch (e) { toast(e.message, 'bad'); }
-          },
-        }, 'Restore'))));
-      foot.append(box);
+          }));
+      }
     }
   }
+}
+
+/*
+ * Deleting an ignored suggestion and un-ignoring one are the same edit — the entry leaves
+ * the list and the idea becomes proposable again. The two names exist because in the plan
+ * view you are un-hiding one specific gap, and here you are pruning a list.
+ */
+async function forgetIgnored(title, forget) {
+  try {
+    const r = await api('/api/ai/unignore', { title, forget: forget !== false });
+    IGNORED = r.ignored; IGNORED_TITLES = r.ignored.map(x => x.title);
+    toast(r.message, 'good');
+    await load();
+    if (railOpen) renderRail();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+/* ── plan freshness ──────────────────────────────────────────────── */
+/*
+ * A plan describes the tracker as it was when it was generated. File a couple of issues or
+ * close a couple, and it is quietly out of date while still looking authoritative — so the
+ * button that made it says so, and offers to update rather than only to start over.
+ */
+function driftText(st) {
+  if (!st || !st.hasPlan) return 'No plan has been generated for this repository yet.';
+  // A scoped plan only counts drift inside its slice, so say which slice it is speaking for.
+  const where = st.scopeText ? ' in ' + st.scopeText : '';
+  if (!st.stale) return 'The plan still matches the issues' + where + ' it was generated from.';
+  const bits = [];
+  if (st.added.length) bits.push(st.added.length + ' issue' + (st.added.length === 1 ? '' : 's') + ' filed');
+  if (st.closed.length) bits.push(st.closed.length + ' closed');
+  return bits.join(' and ') + where +
+    (st.capturedAt ? ' since the plan of ' + st.capturedAt : ' since the plan was generated') + '.';
+}
+
+function planButtonRow(ready) {
+  const st = (S && S.planStatus) || {};
+  const btn = h('button', {
+    class: 'btn wide', disabled: !ready,
+    onclick: () => { planChoice = st.hasPlan ? !planChoice : false; if (st.hasPlan) renderRail(); else runPlan('new'); },
+  }, st.hasPlan ? 'Regenerate plan…' : 'Generate plan + insights');
+  return h('div', {}, h('div', { class: 'planrow' }, btn,
+    st.stale ? h('span', { class: 'drift', title: driftText(st), 'aria-label': driftText(st) }) : null),
+    planScopeRow(), planSizeRow());
+}
+
+/* How many open issues the current scope actually contains — the number that decides
+   whether a plan length is generous or nowhere near enough. */
+function planScopeCount() {
+  if (!S || !S.issues) return 0;
+  return S.issues.filter(i => i.st === 'OPEN'
+    && (!planScope.milestone || i.ms === planScope.milestone)
+    && (!planScope.label || i.l.includes(planScope.label))).length;
+}
+
+/*
+ * What the next plan should be about. Two dropdowns rather than a free-text box: both are
+ * validated against live repository metadata server-side, and a typo that produced an
+ * empty plan would read as "there is nothing to do".
+ */
+function planScopeRow() {
+  const milestones = ((S.github && S.github.milestones) || []).map(m => m.title);
+  const used = new Map();
+  (S.issues || []).forEach(i => i.l.forEach(n => used.set(n, (used.get(n) || 0) + 1)));
+  const labels = [...used.keys()].sort((a, b) => a.localeCompare(b));
+
+  const ms = h('select', { title: 'Restrict the plan to one milestone', style: { width: '100%' } },
+    h('option', { value: '', selected: !planScope.milestone }, 'Every milestone'),
+    ...milestones.map(t => h('option', { value: t, selected: planScope.milestone === t }, t)));
+  ms.addEventListener('change', () => { planScope.milestone = ms.value || null; renderRail(); });
+
+  const lb = h('select', { title: 'Restrict the plan to one label', style: { width: '100%' } },
+    h('option', { value: '', selected: !planScope.label }, 'Every label'),
+    ...labels.map(n => h('option', { value: n, selected: planScope.label === n }, n + '  (' + used.get(n) + ')')));
+  lb.addEventListener('change', () => { planScope.label = lb.value || null; renderRail(); });
+
+  const box = h('div', { class: 'planscope' }, ms, lb);
+  const scoped = !!(planScope.milestone || planScope.label);
+  if (scoped) {
+    const n = planScopeCount();
+    box.append(h('div', { class: 'acts' },
+      h('span', { class: 'lab' }, n + ' open issue' + (n === 1 ? '' : 's') + ' in scope'),
+      h('button', {
+        class: 'btn sm',
+        onclick: () => { planScope = { milestone: null, label: null }; renderRail(); },
+      }, 'Whole tracker')));
+  }
+  return box;
+}
+
+/* How long the next plan should be. Offered next to the button that makes it, because the
+   right answer depends on how many issues are in scope — which is right there. */
+function planSizeRow() {
+  const open = planScopeCount();
+  const sel = h('select', {}, ...[10, 15, 20, 30, 40, 50].map(n =>
+    h('option', { value: String(n), selected: n === planCount }, n + ' entries')));
+  sel.addEventListener('change', () => { planCount = Number(sel.value) || 15; renderRail(); });
+  return h('label', { class: 'inline-check', style: { marginTop: '6px' } }, sel,
+    h('span', { class: 'lab' }, open ? 'of ' + open + ' open' : 'plan length'));
+}
+
+function planChoiceBox() {
+  const st = (S && S.planStatus) || {};
+  const want = planScope.milestone || planScope.label
+    ? [planScope.milestone, planScope.label && 'labelled ' + planScope.label].filter(Boolean).join(' · ')
+    : 'the whole tracker';
+  // Scope is a property of the plan, so an update keeps the one it was built with. Only
+  // "Generate new" adopts what the dropdowns currently say — spell out which is which.
+  const differs = (st.scopeText || 'the whole tracker') !== want;
+  return h('div', { class: 'choice' },
+    h('span', { class: 'lab' }, 'A plan already exists'),
+    h('p', {}, driftText(st)),
+    differs ? h('p', {}, 'Updating keeps it scoped to ' +
+      (st.scopeText || 'the whole tracker') + '. Generating new switches it to ' + want + '.') : null,
+    h('div', { class: 'acts' },
+      h('button', {
+        class: 'btn sm primary',
+        title: 'Keep the entries that are still right; place what changed',
+        onclick: () => { planChoice = false; runPlan('update'); },
+      }, 'Update current plan'),
+      h('button', {
+        class: 'btn sm', title: 'Start over from the current issues',
+        onclick: () => { planChoice = false; runPlan('new'); },
+      }, 'Generate new'),
+      h('button', { class: 'btn sm', onclick: () => { planChoice = false; renderRail(); } }, 'Cancel')));
+}
+
+/*
+ * A duplicate group. The action offered is deliberately conservative: close the newer ones
+ * with a comment pointing at the oldest, which keeps the discussion in one place and is
+ * reversible from the staged queue right up until the push.
+ */
+function dupeCard(cluster) {
+  const keep = cluster.members.find(m => m.number === cluster.keep) || cluster.members[0];
+  const others = cluster.members.filter(m => m.number !== keep.number);
+  const row = (m, isKeep) => h('div', { class: 'move' + (m.state === 'OPEN' ? '' : ' closed') },
+    h('button', {
+      class: 'linkish', onclick: () => { SEL.issue = m.number; VIEW = 'issues'; render(); },
+    }, '#' + m.number),
+    ' ', m.title,
+    isKeep ? h('span', { class: 'chip ok' }, 'keep') : null,
+    m.state === 'OPEN' ? null : h('span', { class: 'chip' }, 'closed'),
+    m.comments ? h('span', { class: 'chip' }, m.comments + ' comment' + (m.comments === 1 ? '' : 's')) : null);
+
+  return h('div', { class: 'prop', style: { '--c': 'var(--warn)' } },
+    h('div', { class: 'h' },
+      h('span', { class: 't' }, cluster.members.length + ' issues look like the same work'),
+      h('span', { class: 'conf ' + (cluster.score >= 0.85 ? 'hi' : 'mid') }, Math.round(cluster.score * 100) + '%')),
+    cluster.series
+      ? h('div', { class: 'move' }, h('b', {}, 'Careful: '),
+        'these read like parallel tasks in one series, which is not the same as one task filed twice.')
+      : null,
+    row(keep, true),
+    ...others.map(m => row(m, false)),
+    h('div', { class: 'acts' },
+      h('button', {
+        class: 'btn sm primary',
+        disabled: !others.some(m => m.state === 'OPEN'),
+        title: 'Stage a close on the newer ones, each commenting with a pointer to #' + keep.number,
+        onclick: async () => {
+          busy(true);
+          let n = 0;
+          try {
+            for (const m of others.filter(x => x.state === 'OPEN')) {
+              try {
+                await api('/api/queue/add', {
+                  kind: 'close',
+                  payload: {
+                    number: m.number, reason: 'not planned',
+                    comment: 'Duplicate of #' + keep.number + ' — continuing there.',
+                  },
+                });
+                n++;
+              } catch { /* already staged */ }
+            }
+            DUPES = DUPES.filter(c => c !== cluster);
+            await load(); renderRail();
+            toast('Staged ' + n + ' close' + (n === 1 ? '' : 's') + ' pointing at #' + keep.number, n ? 'good' : 'bad');
+          } finally { busy(false); }
+        },
+      }, 'Stage close as duplicate'),
+      h('button', {
+        class: 'btn sm', onclick: () => { DUPES = DUPES.filter(c => c !== cluster); renderRail(); },
+      }, 'Not duplicates')));
+}
+
+function labelCard(l) {
+  return h('div', { class: 'prop', style: { '--c': 'var(--p4)' } },
+    h('div', { class: 'h' }, h('span', { class: 't' }, l.name),
+      h('span', { class: 'lab' }, l.issues.length + ' issue' + (l.issues.length === 1 ? '' : 's'))),
+    h('div', { class: 'move' }, 'from ', h('b', {}, l.issues.map(n => '#' + n).join(' '))),
+    l.description ? h('p', { class: 'r' }, l.description) : null,
+    l.why ? h('p', { class: 'r' }, l.why) : null,
+    h('div', { class: 'acts' },
+      h('button', {
+        class: 'btn sm primary',
+        onclick: async () => {
+          await stage('label', { name: l.name, description: l.description || null });
+          NEW_LABELS = NEW_LABELS.filter(y => y !== l); renderRail();
+        },
+      }, 'Stage label'),
+      h('button', { class: 'btn sm', onclick: () => { NEW_LABELS = NEW_LABELS.filter(y => y !== l); renderRail(); } }, 'Skip')));
 }
 
 function milestoneCard(ms) {
@@ -1371,23 +2276,20 @@ function milestoneCard(ms) {
 }
 
 async function runMilestones() {
-  aiBusy = true; busy(true); renderRail(); renderNav();
-  try {
-    const r = await api('/api/ai/milestones', {});
-    MILESTONES = r.milestones; toast(r.message, r.milestones.length ? 'good' : '');
-  } catch (e) { toast(e.message, 'bad'); }
-  finally { aiBusy = false; busy(false); renderRail(); renderNav(); }
+  const r = await runAi(jobId => api('/api/ai/milestones', { jobId }));
+  if (r) { MILESTONES = r.milestones; renderRail(); }
 }
 
-async function runPlan() {
-  aiBusy = true; busy(true); renderRail(); renderNav();
-  try {
-    const r = await api('/api/ai/plan', { count: 10 });
-    toast(r.message, 'good');
-    await load();
-    VIEW = 'plan'; render();
-  } catch (e) { toast(e.message, 'bad'); }
-  finally { aiBusy = false; busy(false); renderRail(); renderNav(); }
+async function runPlan(mode) {
+  const r = await runAi(jobId => api('/api/ai/plan', {
+    count: planCount, mode: mode || 'new', jobId,
+    // An update reuses the scope already saved with the plan; the server ignores these.
+    milestone: planScope.milestone, label: planScope.label,
+  }));
+  if (!r) return;
+  planBannerOff = false;
+  await load();
+  VIEW = 'plan'; render();
 }
 
 /* Embedding models are small and named for it; surface them separately so the two
@@ -1484,23 +2386,24 @@ function stageProposal(x, quiet) {
 }
 
 async function runClassify(includeClassified) {
-  aiBusy = true; busy(true); renderRail(); renderNav();
-  try {
-    const r = await api('/api/ai/classify', { includeClassified, limit: 40 });
-    PROPOSALS = r.proposals; SUGGESTIONS = [];
-    toast(r.message, 'good');
-  } catch (e) { toast(e.message, 'bad'); }
-  finally { aiBusy = false; busy(false); renderRail(); renderNav(); }
+  const r = await runAi(jobId => api('/api/ai/classify', { includeClassified, limit: 40, jobId }));
+  if (!r) return;
+  PROPOSALS = r.proposals; SUGGESTIONS = [];
+  /* Categories the model had to invent to place something are proposals in their own
+     right, and share the milestone card the dedicated suggester already uses. */
+  MILESTONES = (r.newMilestones || []).map(m => ({
+    title: m.title, description: m.description,
+    rationale: m.why, coversIssues: m.issues,
+  }));
+  NEW_LABELS = r.newLabels || [];
+  renderRail();
 }
 
 async function runSuggest() {
-  aiBusy = true; busy(true); renderRail(); renderNav();
-  try {
-    const r = await api('/api/ai/suggest', { count: 6 });
-    SUGGESTIONS = r.suggestions; PROPOSALS = [];
-    toast(r.message + (r.usedPlan ? ' (using the repo plan)' : ''), 'good');
-  } catch (e) { toast(e.message, 'bad'); }
-  finally { aiBusy = false; busy(false); renderRail(); renderNav(); }
+  const r = await runAi(jobId => api('/api/ai/suggest', { count: 6, jobId }));
+  if (!r) return;
+  SUGGESTIONS = r.suggestions; PROPOSALS = [];
+  renderRail();
 }
 
 
@@ -1543,6 +2446,7 @@ function stagedEditor(c) {
   if (c.kind === 'create' || c.kind === 'milestone') addText('title', 'Title', P.title);
   if (c.kind === 'create') addText('body', 'Body', P.body, true);
   if (c.kind === 'milestone') { addText('description', 'Description', P.description, true); addText('dueOn', 'Due date (YYYY-MM-DD)', P.dueOn); }
+  if (c.kind === 'label') { addText('name', 'Name', P.name); addText('description', 'Description', P.description); }
   if (c.kind === 'comment') addText('body', 'Comment', P.body, true);
   if (c.kind === 'edit' && P.title != null) addText('title', 'New title', P.title);
   if (c.kind === 'close') addText('comment', 'Closing comment (optional)', P.comment, true);
@@ -1583,6 +2487,7 @@ function stagedEditor(c) {
       onclick: async () => {
         const payload = {};
         if (fields.title) payload.title = fields.title();
+        if (fields.name) payload.name = fields.name();
         if (fields.body) payload.body = fields.body();
         if (fields.description) payload.description = fields.description();
         if (fields.dueOn) payload.dueOn = fields.dueOn() || null;
@@ -1637,20 +2542,48 @@ function sidePrs(body, foot) {
   foot.append(newPrButton());
 }
 
-/* Offer "open a PR" only when the branch could actually have one. */
-function newPrButton() {
+/*
+ * "Open a pull request from this branch" — the GitHub Desktop affordance.
+ *
+ * A branch with no upstream is not a dead end: it is a branch that needs publishing, and
+ * the form says so and offers to do it. Disabling the button and leaving the user to find
+ * the push control themselves was the wrong half of the answer.
+ */
+function newPrButton(wide = true) {
   const st = S.git && S.git.status;
   const existing = S.branchPr;
+  const cls = 'btn primary' + (wide ? ' wide' : ' sm');
   if (existing && existing.st === 'OPEN') {
-    return h('a', { class: 'btn wide primary', href: existing.url, target: '_blank', rel: 'noreferrer noopener' },
+    return h('a', { class: cls, href: existing.url, target: '_blank', rel: 'noreferrer noopener' },
       'View PR #' + existing.n + ' ↗');
   }
-  const can = st && st.branch && st.upstream;
+  const can = !!(st && st.branch && !st.detached && S.selected && S.selected.github);
   return h('button', {
-    class: 'btn wide primary', disabled: !can,
-    title: can ? '' : 'Push this branch first — a PR needs an upstream',
+    class: cls, disabled: !can,
+    title: can ? 'Open a pull request from ' + st.branch : 'Needs a branch and a GitHub remote',
     onclick: () => { SEL.pr = 'new'; VIEW = 'prs'; render(); },
-  }, can ? 'Create pull request' : 'Push branch to open a PR');
+  }, 'Create pull request');
+}
+
+/*
+ * Every branch a pull request could be merged into: the local ones, plus branches that
+ * exist only on the remote. Listing local branches alone hid the common case — merging
+ * into a long-lived branch this clone has never checked out.
+ */
+function baseBranchOptions() {
+  const st = S.git.status;
+  const local = (S.git.branches.local || []).map(b => b.name);
+  const remoteOnly = S.git.branches.remoteOnly || [];
+  const seen = new Set();
+  return [...local, ...remoteOnly].filter(name =>
+    name && name !== st.branch && !seen.has(name) && seen.add(name));
+}
+
+/* The repository's own default branch, not a guess at what it might be called. */
+function defaultBaseBranch(names) {
+  const dflt = S.github && S.github.defaultBranch;
+  if (dflt && names.includes(dflt)) return dflt;
+  return names.find(n => /^(main|master|develop|development)$/i.test(n)) || names[0] || null;
 }
 
 async function panePrs(p) {
@@ -1702,30 +2635,58 @@ async function panePrs(p) {
 
 function paneNewPr(p) {
   const st = S.git.status;
+  const names = baseBranchOptions();
+  const chosen = defaultBaseBranch(names);
   const title = h('input', { type: 'text', placeholder: 'Pull request title' });
   title.value = (S.git.log && S.git.log[0] && S.git.log[0].subject) || '';
   const body = h('textarea', { placeholder: 'Description', style: { minHeight: '150px' } });
-  const base = h('select', {}, ...(S.git.branches.local || [])
-    .filter(b => b.name !== st.branch)
-    .map(b => h('option', { value: b.name, selected: /^(main|master|develop)$/.test(b.name) }, b.name)));
+  const base = h('select', {}, ...names.map(n => h('option', { value: n, selected: n === chosen },
+    n + (n === (S.github && S.github.defaultBranch) ? '  (default)' : '') +
+    ((S.git.branches.remoteOnly || []).includes(n) ? '  (remote only)' : ''))));
   const draft = h('input', { type: 'checkbox' });
-  p.append(h('div', { class: 'pane-narrow detail' },
+  const route = h('span', { class: 'chip' }, st.branch + ' → ' + (chosen || '?'));
+  base.addEventListener('change', () => { route.textContent = st.branch + ' → ' + base.value; });
+  const wrap = h('div', { class: 'pane-narrow detail' },
     h('div', { class: 'head' }, h('div', { class: 't' }, 'New pull request'),
-      h('span', { class: 'lab' }, 'from ' + st.branch)),
+      h('div', { class: 'tags' }, route,
+        st.ahead ? h('span', { class: 'chip' }, st.ahead + ' ahead') : null)));
+
+  if (!names.length) {
+    wrap.append(h('div', { class: 'banner warn' },
+      'There is no other branch to merge into. Create one, or fetch the remote first.'));
+  }
+
+  /* A branch that only exists locally has nothing for GitHub to compare, so the form says
+     what is missing and does that one step rather than refusing the whole action. */
+  if (!st.upstream) {
+    wrap.append(h('div', { class: 'banner warn' },
+      h('b', {}, st.branch + ' is not on GitHub yet. '),
+      'A pull request needs the branch pushed first.',
+      h('div', { class: 'acts', style: { marginTop: '8px' } },
+        h('button', {
+          class: 'btn sm primary',
+          onclick: () => act(() => api('/api/git/sync', { action: 'push' }), 'git'),
+        }, 'Publish ' + st.branch))));
+  }
+
+  const submit = arm(h('button', { class: 'btn primary', disabled: !names.length || !st.upstream },
+    'Create pull request'),
+  'Create pull request', 'Confirm — this is public',
+  async () => {
+    const r = await act(() => api('/api/pr/create', {
+      title: title.value.trim(), body: body.value, base: base.value, head: st.branch, draft: draft.checked,
+    }), 'git');
+    SEL.pr = (r && r.number) || null; prLoaded = false; loadPrs();
+  });
+
+  wrap.append(
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Title'), title),
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Merge into'), base),
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Description'), body),
     h('label', { class: 'acts' }, draft, h('span', { class: 'lab' }, 'Open as a draft')),
-    h('div', { class: 'acts' },
-      arm(h('button', { class: 'btn primary' }, 'Create pull request'),
-        'Create pull request', 'Confirm — this is public',
-        async () => {
-          const r = await act(() => api('/api/pr/create', {
-            title: title.value.trim(), body: body.value, base: base.value, head: st.branch, draft: draft.checked,
-          }), 'git');
-          SEL.pr = (r && r.number) || null; prLoaded = false; loadPrs();
-        }),
-      h('button', { class: 'btn', onclick: () => { SEL.pr = null; renderPane(); } }, 'Cancel'))));
+    h('div', { class: 'acts' }, submit,
+      h('button', { class: 'btn', onclick: () => { SEL.pr = null; renderPane(); } }, 'Cancel')));
+  p.append(wrap);
 }
 
 /* ── popovers ────────────────────────────────────────────────────── */
@@ -1846,6 +2807,224 @@ $('tb-sync').addEventListener('click', () => popover($('tb-sync'), 'Sync with or
     st.upstream ? 'Send commits to ' + st.upstream : 'Sets upstream to origin/' + (st.branch || '?'), 'push'));
 }));
 
+/* ── command palette ─────────────────────────────────────────────── */
+/*
+ * Ctrl-K. One box that reaches everything: views, repositories, branches, assistant
+ * actions, and every issue in the tracker by meaning rather than by exact title.
+ *
+ * The issue search runs through the same hybrid endpoint the sidebar uses, so typing
+ * "the thing about chests" finds the issue even when it never says "chest".
+ */
+let paletteOpen = false;
+let paletteSeq = 0;
+
+function paletteActions() {
+  const out = [];
+  const add = (group, name, hint, run, enabled = true) => out.push({ group, name, hint, run, enabled });
+
+  add('Go', 'Issues', 'issue list', () => { VIEW = 'issues'; render(); });
+  add('Go', 'Plan', 'recommended order', () => { VIEW = 'plan'; render(); }, !!(S && S.insights));
+  add('Go', 'Changes', 'working tree', () => { VIEW = 'changes'; render(); refreshGit(); });
+  add('Go', 'History', 'recent commits', () => { VIEW = 'history'; render(); refreshGit(); });
+  add('Go', 'Pull requests', '', () => { VIEW = 'prs'; render(); if (!prLoaded) loadPrs(); });
+  add('Go', 'Staged changes', (S ? S.queue.length : 0) + ' waiting', () => { VIEW = 'staged'; render(); });
+
+  add('Do', 'Pull issues from GitHub', '', () => pullIssues(), !!(S && S.selected && S.selected.github));
+  add('Do', 'Refresh everything', '', () => $('btn-refresh').click());
+  add('Do', 'New issue', 'staged, not filed', () => { VIEW = 'issues'; SEL.issue = 'new'; render(); });
+  add('Do', 'Create pull request', S && S.git && S.git.status.branch ? 'from ' + S.git.status.branch : '',
+    () => { SEL.pr = 'new'; VIEW = 'prs'; render(); },
+    !!(S && S.selected && S.selected.github && S.git && S.git.status.branch && !S.git.status.detached));
+  if (S && S.queue.length) {
+    add('Do', 'Push ' + S.queue.length + ' staged change' + (S.queue.length === 1 ? '' : 's'),
+      S.dryRun ? 'dry run' : 'writes to GitHub', () => act(() => api('/api/queue/push', {}), 'queue'));
+  }
+  add('Do', 'Toggle assistant panel', '', () => toggleRail());
+
+  add('Assistant', 'Chat', 'ask about this repo', () => { toggleRail(true); RAIL_TAB = 'chat'; renderRail(); });
+  add('Assistant', 'Classify unassigned issues', '', () => { toggleRail(true); RAIL_TAB = 'run'; renderRail(); runClassify(false); },
+    assistantAvailable());
+  add('Assistant', 'Suggest missing issues', '', () => { toggleRail(true); RAIL_TAB = 'run'; renderRail(); runSuggest(); },
+    assistantAvailable());
+  add('Assistant', (S && S.planStatus && S.planStatus.hasPlan) ? 'Update the plan' : 'Generate a plan',
+    (S && S.planStatus && S.planStatus.stale) ? 'the tracker moved on' : '',
+    () => { toggleRail(true); RAIL_TAB = 'run'; renderRail(); runPlan(S && S.planStatus && S.planStatus.hasPlan ? 'update' : 'new'); },
+    assistantAvailable());
+  add('Assistant', 'Find duplicate issues', 'no model call', async () => {
+    toggleRail(true); RAIL_TAB = 'run';
+    try {
+      const r = await api('/api/issues/duplicates', { includeClosed: dupeClosed });
+      DUPES = r.clusters; DUPE_SCALE = r.scale || null; toast(r.message, r.clusters.length ? 'good' : '');
+    } catch (e) { toast(e.message, 'bad'); }
+    renderRail();
+  });
+  if (aiBusy || chatBusy) add('Assistant', 'Cancel what the model is doing', '', () => { cancelAi('run'); cancelAi('chat'); });
+
+  (S ? S.repos : []).forEach(r => {
+    if (S.selected && S.selected.path === r.path) return;
+    add('Repository', r.name, r.github || r.path,
+      () => act(() => api('/api/repos/select', { path: r.path }), 'git'));
+  });
+  if (S && S.git) {
+    S.git.branches.local.forEach(b => {
+      if (b.current) return;
+      add('Branch', b.name, 'check out', () => act(() => api('/api/git/checkout', { branch: b.name })));
+    });
+  }
+  return out.filter(x => x.enabled);
+}
+
+/* Subsequence match, the way every command palette works: "gp" finds "Generate a plan". */
+function fuzzy(needle, haystack) {
+  const n = needle.toLowerCase(), h = haystack.toLowerCase();
+  if (!n) return 0.5;
+  if (h.includes(n)) return 1 - (h.indexOf(n) / (h.length + 1)) * 0.3;
+  let at = 0, hits = 0;
+  for (const ch of n) {
+    const found = h.indexOf(ch, at);
+    if (found < 0) return 0;
+    if (found === at) hits += 0.5;
+    at = found + 1;
+  }
+  return 0.35 + (hits / n.length) * 0.2;
+}
+
+function openPalette() {
+  if (paletteOpen) return closePalette();
+  paletteOpen = true;
+  const input = h('input', {
+    type: 'text', class: 'pal-input', placeholder: 'Jump to an issue, or run a command…',
+    'aria-label': 'Command palette',
+  });
+  const list = h('div', { class: 'pal-list', role: 'listbox' });
+  const overlay = h('div', { class: 'pal-overlay', id: 'palette' },
+    h('div', { class: 'pal', role: 'dialog', 'aria-label': 'Command palette' },
+      input, list,
+      h('div', { class: 'pal-foot' },
+        h('span', { class: 'lab' }, '↑↓ move · enter run · esc close'))));
+  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) closePalette(); });
+  document.body.append(overlay);
+
+  let rows = [], cursor = 0;
+
+  const draw = () => {
+    clear(list);
+    if (!rows.length) {
+      list.append(h('div', { class: 'empty' }, 'Nothing matches.'));
+      return;
+    }
+    rows.forEach((row, idx) => {
+      const el = h('div', {
+        class: 'pal-row' + (idx === cursor ? ' on' : ''), role: 'option',
+        'aria-selected': String(idx === cursor),
+        onmousemove: () => { if (cursor !== idx) { cursor = idx; draw(); } },
+        onclick: () => { closePalette(); row.run(); },
+      },
+        h('span', { class: 'g' }, row.group),
+        h('span', { class: 't' }, row.name),
+        row.hint ? h('span', { class: 'hint' }, row.hint) : null);
+      list.append(el);
+      if (idx === cursor) el.scrollIntoView({ block: 'nearest' });
+    });
+  };
+
+  const recompute = async (raw) => {
+    const q = raw.trim();
+    const mine = ++paletteSeq;
+    const actions = paletteActions()
+      .map(a => ({ ...a, score: Math.max(fuzzy(q, a.name), fuzzy(q, a.group + ' ' + a.name) * 0.9) }))
+      .filter(a => a.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, q ? 8 : 12);
+    rows = actions;
+    cursor = 0;
+    draw();
+    if (q.length < 2 || !S || !S.issuesLoaded) return;
+
+    // Issues are searched server-side so meaning counts, and folded in beneath the actions.
+    try {
+      const r = await api('/api/issues/search', { q, state: 'all', limit: 8 });
+      if (mine !== paletteSeq || !paletteOpen) return;
+      const byNum = new Map(S.issues.map(i => [i.n, i]));
+      const issueRows = r.hits.map(hit => {
+        const issue = byNum.get(hit.number);
+        if (!issue) return null;
+        return {
+          group: '#' + issue.n,
+          name: issue.t,
+          hint: (issue.st === 'OPEN' ? '' : 'closed · ') + (hit.why || ''),
+          run: () => { VIEW = 'issues'; SEL.issue = issue.n; render(); },
+        };
+      }).filter(Boolean);
+      rows = actions.slice(0, 5).concat(issueRows);
+      cursor = Math.min(cursor, Math.max(0, rows.length - 1));
+      draw();
+    } catch { /* the action list is still useful on its own */ }
+  };
+
+  input.addEventListener('input', () => recompute(input.value));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); cursor = Math.min(cursor + 1, rows.length - 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); cursor = Math.max(cursor - 1, 0); draw(); }
+    else if (e.key === 'Enter') {
+      e.preventDefault();
+      const row = rows[cursor];
+      if (row) { closePalette(); row.run(); }
+    } else if (e.key === 'Escape') { e.preventDefault(); closePalette(); }
+  });
+  recompute('');
+  input.focus();
+}
+
+function closePalette() {
+  paletteOpen = false;
+  paletteSeq++;
+  const el = $('palette');
+  if (el) el.remove();
+}
+
+/* ── keyboard ────────────────────────────────────────────────────── */
+/*
+ * Shortcuts only fire when you are not typing. Checking the event target rather than a
+ * global "modal open" flag means a text field anywhere — including ones added later —
+ * keeps its keys without anything having to know about it.
+ */
+const typingIn = (el) => !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ||
+  el.tagName === 'SELECT' || el.isContentEditable);
+
+function moveIssueCursor(delta) {
+  const rows = visibleIssues();
+  if (!rows.length) return;
+  const at = rows.findIndex(i => i.n === SEL.issue);
+  const next = at < 0 ? 0 : Math.max(0, Math.min(rows.length - 1, at + delta));
+  SEL.issue = rows[next].n;
+  renderIssueList(); renderPane();
+  const el = document.querySelector('#issue-list .irow[aria-selected="true"]');
+  if (el) el.scrollIntoView({ block: 'nearest' });
+}
+
+document.addEventListener('keydown', (e) => {
+  if ((e.key === 'k' || e.key === 'K') && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    return openPalette();
+  }
+  // Escape closes the palette from anywhere, not only from its input. Clicking a row or
+  // the scrollbar moves focus, and a dialog you cannot dismiss is worse than no dialog.
+  if (e.key === 'Escape' && paletteOpen) { e.preventDefault(); return closePalette(); }
+  if (paletteOpen || typingIn(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
+
+  if (e.key === '/') { e.preventDefault(); const box = $('issue-search'); if (box) { box.focus(); box.select(); } return; }
+  if (e.key === '?') { e.preventDefault(); return openPalette(); }
+  if (VIEW !== 'issues') return;
+
+  if (e.key === 'j') { e.preventDefault(); moveIssueCursor(1); }
+  else if (e.key === 'k') { e.preventDefault(); moveIssueCursor(-1); }
+  else if (e.key === 'x') {
+    e.preventDefault();
+    if (SEL.issue != null && SEL.issue !== 'new') togglePick(SEL.issue, false);
+  } else if (e.key === 'Escape' && PICKED.size) { e.preventDefault(); clearPicked(); }
+});
+
 /* ── wiring ──────────────────────────────────────────────────────── */
 $('nav').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-view]');
@@ -1855,7 +3034,8 @@ $('nav').addEventListener('click', (e) => {
   // Opening Changes or History should show the tree as it is NOW, not as it was when the
   // page last loaded. Git calls are ~0ms, so this is free.
   if (VIEW === 'changes' || VIEW === 'history') refreshGit();
-  if (VIEW === 'changes' && !AI) aiStatus();
+  // Plan and Changes both offer assistant actions, so they need to know whether it is up.
+  if ((VIEW === 'changes' || VIEW === 'plan') && !AI) aiStatus();
   if (VIEW === 'prs' && !prLoaded) loadPrs();
 });
 
@@ -1893,6 +3073,11 @@ $('btn-refresh').addEventListener('click', async () => {
 $('btn-ai').addEventListener('click', () => toggleRail());
 $('ai-close').addEventListener('click', () => toggleRail(false));
 $('ai-tab-run').addEventListener('click', () => { RAIL_TAB = 'run'; renderRail(); });
+$('ai-tab-chat').addEventListener('click', () => {
+  RAIL_TAB = 'chat'; renderRail();
+  const box = document.querySelector('.chat-in');
+  if (box) box.focus();
+});
 $('ai-tab-set').addEventListener('click', () => { RAIL_TAB = 'settings'; renderRail(); });
 
 load();
