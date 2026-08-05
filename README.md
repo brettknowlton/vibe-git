@@ -86,11 +86,102 @@ suggestions, never as direct writes.
 - Stash changes, and pop or drop any individual stash by name — listed in **Changes**
   whether the working tree is dirty or clean, since a clean tree is exactly when a stash
   is the only thing left to restore.
-- Inspect conflict counts after merges.
+- Inspect conflict counts after merges, and resolve them in [the Conflicts
+  view](#resolving-conflicts).
 - Browse recent commit history with commit metadata, file statistics, and full patches.
 
 File staging is currently whole-file only; per-hunk and per-line staging are not yet
 available.
+
+### Resolving conflicts
+
+A **Conflicts** view appears in the sidebar whenever a merge, rebase, cherry-pick, revert or
+stash restore is half-finished, and disappears when it is not.
+
+The thing it is built around is naming the sides. `<<<<<<< HEAD` and `>>>>>>> feature/login`
+only mean something if you already know which operation you are in the middle of — and during
+a **rebase they mean the opposite of what almost everyone assumes**: the block marked `HEAD`
+is the branch you are replaying *onto*, and your own commit is the second one. Keeping "HEAD"
+there throws away your work. So nothing in this view says "ours" or "theirs". Each side is
+labelled with:
+
+- the branch or commit it actually came from,
+- the role it plays in *this* operation ("the branch you are on", "your own commit, being
+  replayed"),
+- when it was written, and which of the two is **newer**,
+- and, as a footnote, which marker introduces it.
+
+A rebase additionally gets a highlighted warning that its sides are reversed.
+
+For each conflict:
+
+- **Keep this** on either side, or **Revert to this** on the common ancestor when it is shown.
+- **Keep both**, in either order.
+- **Write it myself** — a text box pre-filled with both sides so the edit is a deletion.
+- **Ask about this one** — see below.
+
+For the whole file:
+
+- **Use all of `<branch>`** for either side.
+- **Show the ancestor** re-runs the conflict with `--conflict=diff3`, adding what both sides
+  *started from* between them. This is the most useful thing you can do to a conflict you
+  cannot read: it shows what each side **changed** rather than only what each ended up with.
+- **Edit the whole file** as text, markers and all.
+- **Put the conflict back** restores the markers, so a decision made too fast costs nothing.
+
+The four conflicts that have *no markers to edit* — a file changed on one side and deleted on
+the other, added on only one side, deleted on both — get plain-English options about whether
+the file should exist, instead of an empty diff. This is where an editor-only workflow leaves
+you with nothing to look at.
+
+**Images** are shown as pictures rather than as "Binary files differ", in the same columns and
+the same colours as a text conflict, with each version's dimensions and byte size underneath
+and a warning when the two sides are different sizes. Transparency is drawn against a
+checkerboard and pixels are kept square, because most of these are sprites. See
+[Image previews](#image-previews).
+
+**When both sides are byte-identical**, the view says so instead of offering a choice between
+two things that are the same. This happens more often than it sounds: when two branches
+reorganise the same folder under different names, git reports a `file location` conflict on
+files whose contents never changed at all. The status letters call it "both added" and say
+nothing about the cause, which reads as the tool being broken. vibe-git names it, says the
+choice is free, and lets you settle it in one click.
+
+Two deliberate behaviours:
+
+- **Nothing is staged until you say so.** `git add` on a conflicted file destroys the stages
+  Git recorded, and with them any way back, so resolving edits the working file and stops
+  there. **Continue** stages what is finished as its first act, and refuses by name while
+  anything is still undecided.
+- **Edits made in your editor are picked up** while the view is open, and a decision made
+  against a version of the file that has since changed is refused rather than written over
+  the top of it.
+
+With the Assistant configured, **Ask the assistant** reads both sides — plus the ancestor when
+it is present — and proposes a resolution per conflict, with its reasoning and a confidence.
+It is shown the sides *positionally*, never as "ours" and "theirs", for exactly the reason
+above. It can answer "no confident answer", and does on genuinely contradictory changes. It
+never writes: every suggestion shows the exact text it would insert, and applies through the
+same button you would have pressed yourself, or can be edited first, or dismissed.
+
+### Image previews
+
+Selecting an image in **Changes** shows it rather than a text diff: the HEAD version beside
+the working-tree version, each with its pixel dimensions and byte size. A conflicted image
+gets the same treatment in **Conflicts**, one column per side.
+
+- PNG, JPEG, GIF, WebP, BMP and ICO. Dimensions are read from the file header, so nothing is
+  decoded and no dependency is involved.
+- Transparency is drawn against a checkerboard, and pixels are kept square rather than
+  smoothed — both because the common case here is 32×32 sprite work, where a smoothed preview
+  hides exactly the single-pixel differences worth looking at.
+- The extension picks the candidate format and the magic bytes confirm it; a file whose
+  contents disagree with its name is labelled rather than silently mis-rendered.
+- SVG is deliberately excluded. It is markup that can carry script, and it reads perfectly
+  well as a text diff.
+- Images travel as base64 data URIs inside JSON, not from a route that serves bytes, so the
+  page's `img-src data:` CSP is not widened. Anything over 4 MB reports its size instead of
+  being previewed.
 
 ### Branches and synchronization
 
@@ -147,6 +238,12 @@ action produces ordinary staged changes, so a bad sweep is removed from the queu
 than undone on GitHub, and issues that already look the way you asked for are skipped
 rather than restaged.
 
+### Theme
+
+Light, dark, or follow the system setting — the ◐ button in the top bar cycles between them.
+The choice is stored per browser and applied before first paint, so a dark theme on a light
+system does not flash white on every reload.
+
 ### Keyboard
 
 | Key | Does |
@@ -155,7 +252,14 @@ rather than restaged.
 | `/` | Focus the search box |
 | `j` / `k` | Move down / up the issue list |
 | `x` | Add or remove the current issue from the selection |
-| `Esc` | Close the palette, or clear the selection |
+| `a` | Select every visible issue, or clear the selection if all are already selected |
+| `d` / `Esc` | Clear the selection |
+| `m` | Set a milestone on the selected issues |
+| `l` / `Shift`+`L` | Add / remove a label on the selected issues |
+| `Esc` | Close the palette |
+
+Selection keys act on **visible** issues only, so the filter bar bounds every bulk edit. The
+bulk keys open the same menus the mouse uses, and every result is staged rather than applied.
 
 ### Staged GitHub changes
 
@@ -198,6 +302,11 @@ The Plan view combines repository metadata, deterministic prioritization, and op
 editorial guidance:
 
 - Display milestones as a timeline with due dates, descriptions, and open-issue counts.
+- Draw the tracker's dependency structure as a layered graph — blockers above what they
+  block — under **What is blocked**, above the ranking it constrains.
+- Work out which issues block which and propose recording it, as staged body edits.
+- Turn either extra off: **suggest missing issues** and **find dependencies** are separate
+  switches, so a plan can be an ordering of the work that exists and nothing else.
 - Rank recommended work and explain why each item is prioritized.
 - Filter the full view to one milestone.
 - Hide completed recommendations by default, with a **Show hidden** toggle.
@@ -206,6 +315,26 @@ editorial guidance:
 - Stage a new issue from a missing-work proposal.
 - Ignore, restore, or permanently delete proposals that should not become issues.
 - Notice when the tracker has moved on since the plan was generated.
+
+#### Dependencies
+
+Dependencies are read out of issue **bodies**: `blocked by #12`, `depends on #4`, `requires
+#7`, `waiting on #3`, and — only when a `#number` follows closely — `after #9`. `blocks #12`
+means the opposite and is not treated as a dependency of the issue declaring it.
+
+Those edges drive three things: the layered graph in the Plan view, the **Ready** filter in
+the issue list, and the `⛔` marker on blocked rows. A tracker where nothing declares a
+dependency has no graph to draw, and the Plan view says so explicitly rather than showing an
+empty panel.
+
+Because an edge is prose rather than a field, the Assistant can propose one — and does, from
+three places: while generating a plan, while re-checking all open issues, and on request in
+the chat panel. Accepting a proposal stages an ordinary body edit adding a `Blocked by: #N`
+line, so the relationship still reads correctly to anyone looking at the issue on github.com.
+
+Edges are refused rather than drawn when they would be circular, point at a closed issue, or
+duplicate one already written down — and a saved plan re-checks its proposals on every read,
+so an edge that has since been recorded by hand stops being offered.
 
 Milestones and issues are joined by their exact milestone title; names do not need a
 `Phase N` prefix. Milestone order, due dates, issue membership, checklist progress,
@@ -274,8 +403,8 @@ bands, dates, and completion state are filled in from live GitHub metadata.
 
 ### Optional local-model Assistant
 
-The Assistant works with an Ollama-compatible HTTP endpoint and is disabled until it is
-configured. It can:
+The Assistant works with an Ollama, OpenAI-compatible, or Anthropic HTTP endpoint and is
+disabled until it is configured. It can:
 
 - Classify unorganized issues by milestone and label, using existing milestone
   descriptions as the deciding evidence.
@@ -286,11 +415,23 @@ configured. It can:
 - Suggest missing issues using the tracker and an available planning document.
 - Generate or update the Plan view's editorial ordering, explanations, risks, and
   missing-work issue drafts in one action.
-- Answer questions about the repository in a chat panel, looking things up as it goes.
+- Identify ordering constraints between issues and propose recording them, refusing edges
+  that would be circular or point the wrong way.
+- Answer questions about the repository in a chat panel, looking things up as it goes —
+  including reading the source, so it can tell "nobody built this" apart from "somebody
+  built it and never closed the issue".
+- Propose closing an open issue whose work it found already implemented, citing the
+  `file:line` evidence in the closing comment.
 - Summarize selected working-tree changes into an editable commit-message draft.
+- Propose a resolution for each block of a merge conflict, with its reasoning and a
+  confidence — and say plainly when it has no confident answer. It is shown the two sides
+  positionally rather than as "ours" and "theirs", so it cannot invert them the way a rebase
+  invites; see [Resolving conflicts](#resolving-conflicts).
 - Use an optional embedding model to retrieve similar issues as classification
   precedents.
 - Sweep the whole tracker for near-duplicate issues, with no model inference at all.
+- Report what it is doing while it does it — which action, how far through, and which file
+  or issue it is reading right now.
 - Remember ignored suggestions so they are not repeatedly proposed.
 - Unload selected models when they are no longer needed.
 
@@ -359,11 +500,27 @@ when no dedicated planning document exists.
 vibe-git uses the account that `gh` is already authenticated as and stores no GitHub
 credentials of its own. On a shared machine it therefore acts as whoever is signed in.
 
-The Assistant additionally requires an Ollama-compatible model server, and is disabled
-until configured.
+The Assistant additionally requires a model endpoint — Ollama, any OpenAI-compatible
+server, or Anthropic — and is disabled until configured. An API key, where one is needed, is
+stored at mode 0600 and is never sent back to the browser.
 
 Removing a repository from the app removes only its entry; the folder and its files stay
 on disk and it can be added again later.
+
+### Scripting a running instance
+
+`tools/vibe.js` is a dependency-free client for a server that is already running. It finds
+the per-run token itself, so a shell script does not have to scrape it out of the HTML:
+
+```bash
+node tools/vibe.js issues --state open
+node tools/vibe.js close 11 --reason completed --comment "Implemented in lib/llm.js:460."
+node tools/vibe.js queue        # exactly what would run
+node tools/vibe.js push         # the only command that writes to GitHub
+```
+
+`node tools/vibe.js help` lists the rest. It talks to the same guarded API the browser uses,
+so it inherits every guard — including the staged-change queue.
 
 ### Command-line options
 
@@ -395,15 +552,52 @@ The `VIBE_GIT_PORT` environment variable can also set the default port.
 1. Open **Assistant** from the top bar.
 2. Select **Settings**.
 3. Enable Assistant features.
-4. Enter the Ollama-compatible endpoint.
-5. Select a chat model and, optionally, an embedding model.
-6. Adjust concurrency or other model settings if required.
-7. Return to **Run** and choose an action.
+4. Enter the endpoint. Leave **Kind of endpoint** on *Detect automatically* unless it guesses
+   wrong; the panel reports what actually answered.
+5. Enter an API key if the endpoint needs one.
+6. Select a chat model and, optionally, an embedding model.
+7. Adjust concurrency or other model settings if required.
+8. Return to **Run** and choose an action.
 
 ![Assistant settings with endpoint, model, and account state](docs/screenshots/assistant-settings.png)
 
-Only configure an endpoint you trust. Issue bodies, planning documents, and explicitly
-selected file diffs may be sent to that endpoint when Assistant actions run.
+### Supported endpoints
+
+| Kind | Examples | Key |
+|---|---|---|
+| Ollama | `http://127.0.0.1:11434` | none |
+| OpenAI-compatible | llama.cpp `--server`, LM Studio, vLLM, LocalAI, OpenRouter, Groq, Together, OpenAI | bearer token, if hosted |
+| Anthropic | `https://api.anthropic.com` | `x-api-key` |
+
+The URL may be given with or without a trailing `/v1`, and a reverse-proxy prefix is
+preserved. Servers that do not implement JSON-schema response formats — which is many of the
+ones claiming OpenAI compatibility — are detected and fall back automatically.
+
+### API keys
+
+Keys are stored in `~/.config/vibe-git/config.json` at mode 0600 and are never returned to
+the browser; the settings panel shows only whether one is set.
+
+Better still, keep the key out of the file entirely by storing the *name* of an environment
+variable, which is read at call time:
+
+```json
+{ "ai": { "apiKey": "${OPENROUTER_API_KEY}" } }
+```
+
+### Embeddings
+
+Embeddings are optional and power semantic search, duplicate detection, and the precedent
+retrieval that makes classification noticeably more accurate.
+
+They can live at a **different endpoint** from chat, which matters in two cases: Anthropic has
+no embedding API at all, and pairing a hosted chat model with a local `nomic-embed-text` keeps
+every issue body on your own machine. Set the embedding endpoint under *Separate endpoint for
+embeddings* in Settings.
+
+Only configure an endpoint you trust. Issue bodies, planning documents, tracked source files
+the Assistant chooses to read, and explicitly selected file diffs may be sent to that endpoint
+when Assistant actions run.
 
 ## Local data and privacy
 
@@ -515,8 +709,17 @@ automatically because pull uses `--ff-only`; reconcile it with Git before retryi
 
 ### A merge reports conflicts
 
-Resolve the conflicted files in an editor, stage them, and create the merge commit.
-vibe-git reports conflicts but does not provide a conflict-resolution editor.
+A **Conflicts** view appears in the sidebar for as long as one is half-finished, and the
+banner in **Changes** links straight to it. See [Resolving conflicts](#resolving-conflicts)
+for what it does. **Abort** is available from either place, and restores the branch exactly
+as it was.
+
+### A pull will not fast-forward
+
+vibe-git says why and offers the way out rather than only refusing. Uncommitted changes get a
+one-click **stash, pull, restore**; the stash is kept if any step fails, so nothing is
+discarded. Diverged branches are reported as a merge-or-rebase decision, which vibe-git
+deliberately does not make for you.
 
 ### Assistant actions are slow
 
@@ -542,15 +745,21 @@ Run the dependency-free test suite with `npm test`.
 server.js       HTTP server, API routing, request guards, and static serving
 lib/exec.js     subprocess boundary, dry-run handling, and shared validators
 lib/git.js      working tree, history, branches, and synchronization
+lib/conflicts.js  which side is which, marker parsing, and resolving them
+lib/images.js   image previews: format sniffing, header-only dimensions, data URIs
 lib/issues.js   GitHub issue reads and normalization
 lib/plans.js    deterministic milestone matching, plan hydration, drift, and ranking
 lib/prs.js      pull request reads and creation
 lib/queue.js    persistent, validated GitHub issue operation queue
 lib/repos.js    repository discovery, selection, cloning, and local configuration
-lib/llm.js      optional Ollama-compatible Assistant client
+lib/llm.js      Assistant prompting: classification, gaps, plans, commit messages
+lib/providers.js  the model wire — Ollama, OpenAI-compatible, and Anthropic dialects
+lib/workspace.js  read-only, git-mediated access to the working tree for the Assistant
 lib/search.js   hybrid search, calibrated similarity, duplicates, dependency structure
 lib/assistant.js  the chat panel's read-only tools and propose-only conversation loop
 lib/jobs.js     cancellable Assistant work
+lib/access.js   loopback and tailnet request guards
+tools/vibe.js   command-line client for a running server
 web/            dependency-free browser interface
 test/           Node test suite
 ```
@@ -562,7 +771,8 @@ test/           Node test suite
 - Issue fetching is capped at 800 issues per repository. Very large repositories may also
   hit GitHub API rate limits, which surface as `gh` errors; wait for the limit to reset.
 - File staging operates on whole files only.
-- Merge conflicts require an external editor.
+- Conflict resolution is per-conflict-block, not per-line within a block; a finer split needs
+  the hand editor or an external one. Binary conflicts offer whole-file choices only.
 - Semantic search, related issues and duplicate detection need an embedding model and a
   built index; without one, search falls back to text matching and the other two are off.
 - Chat requires a tool-calling model, holds its transcript only in the browser tab, and

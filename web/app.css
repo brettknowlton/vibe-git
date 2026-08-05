@@ -2,12 +2,14 @@
    Phase colours run warm→cool across the beta timeline, so proximity to a
    deadline reads as temperature. Everything else stays quiet around them.   */
 :root{
+  color-scheme:light;
   --p0:#C4652A; --p1:#9E7C28; --p2:#6B8845; --p3:#2F7C77; --p4:#37608F; --p5:#544D8B;
   --alarm:#B23A2C; --ok:#4A7A4E; --warn:#9E7C28;
   --bg:#E8E7EC; --surface:#F5F4F7; --surface2:#DEDCE5; --raise:#FFFFFF; --chrome:#DCDAE3;
   --line:#C8C5D2; --line-soft:#D9D6E0;
   --fg:#1B1D26; --fg-mid:#4C4E60; --fg-dim:#74758A;
   --fill:#1B1D26; --fill-fg:#F5F4F7;
+  --sel-bg:#2F5FA8; --sel-fg:#FFFFFF;
   --shadow:0 1px 2px rgba(27,29,38,.06), 0 8px 22px -14px rgba(27,29,38,.30);
   --pop:0 12px 34px -10px rgba(27,29,38,.38);
   --serif:ui-serif,Georgia,"Iowan Old Style","Palatino Linotype",Palatino,serif;
@@ -16,32 +18,56 @@
 }
 @media (prefers-color-scheme:dark){
   :root{
+    color-scheme:dark;
     --p0:#E8894A; --p1:#C7A03C; --p2:#93AF66; --p3:#4FA79F; --p4:#5B85BC; --p5:#7C74BC;
     --alarm:#E0705E; --ok:#7FB183; --warn:#C7A03C;
     --bg:#171922; --surface:#1F2130; --surface2:#282B3B; --raise:#252838; --chrome:#12141C;
     --line:#353851; --line-soft:#2C2F42;
     --fg:#E6E5EC; --fg-mid:#A8A8BC; --fg-dim:#7C7C93;
     --fill:#E6E5EC; --fill-fg:#171922;
+    --sel-bg:#3E6FB8; --sel-fg:#FFFFFF;
     --shadow:0 1px 2px rgba(0,0,0,.32), 0 10px 26px -16px rgba(0,0,0,.7);
     --pop:0 16px 40px -12px rgba(0,0,0,.75);
   }
 }
+/* The forced themes below must repeat EVERY token the media query sets, shadows included.
+   A block that redefines the colours but inherits dark shadows renders a light theme with
+   black halos under every popover — which is what happens when these are treated as a
+   colour patch rather than a complete palette. */
 :root[data-theme="light"]{
+  color-scheme:light;
   --p0:#C4652A; --p1:#9E7C28; --p2:#6B8845; --p3:#2F7C77; --p4:#37608F; --p5:#544D8B;
   --alarm:#B23A2C; --ok:#4A7A4E; --warn:#9E7C28;
   --bg:#E8E7EC; --surface:#F5F4F7; --surface2:#DEDCE5; --raise:#FFFFFF; --chrome:#DCDAE3;
   --line:#C8C5D2; --line-soft:#D9D6E0;
   --fg:#1B1D26; --fg-mid:#4C4E60; --fg-dim:#74758A;
   --fill:#1B1D26; --fill-fg:#F5F4F7;
+  --sel-bg:#2F5FA8; --sel-fg:#FFFFFF;
+  --shadow:0 1px 2px rgba(27,29,38,.06), 0 8px 22px -14px rgba(27,29,38,.30);
+  --pop:0 12px 34px -10px rgba(27,29,38,.38);
 }
 :root[data-theme="dark"]{
+  color-scheme:dark;
   --p0:#E8894A; --p1:#C7A03C; --p2:#93AF66; --p3:#4FA79F; --p4:#5B85BC; --p5:#7C74BC;
   --alarm:#E0705E; --ok:#7FB183; --warn:#C7A03C;
   --bg:#171922; --surface:#1F2130; --surface2:#282B3B; --raise:#252838; --chrome:#12141C;
   --line:#353851; --line-soft:#2C2F42;
   --fg:#E6E5EC; --fg-mid:#A8A8BC; --fg-dim:#7C7C93;
   --fill:#E6E5EC; --fill-fg:#171922;
+  --sel-bg:#3E6FB8; --sel-fg:#FFFFFF;
+  --shadow:0 1px 2px rgba(0,0,0,.32), 0 10px 26px -16px rgba(0,0,0,.7);
+  --pop:0 16px 40px -12px rgba(0,0,0,.75);
 }
+
+/* Selection is painted explicitly rather than left to the browser.
+   Left alone, the UA derives Highlight/HighlightText from the OS, not from this palette —
+   so on a light-on-dark OS setting the highlight kept white text and drew it over the white
+   input background, and the text you had just selected disappeared. Both halves are pinned
+   here so the pair is always legible whichever way the OS is set. */
+::selection{background:var(--sel-bg); color:var(--sel-fg)}
+::-moz-selection{background:var(--sel-bg); color:var(--sel-fg)}
+input::selection,textarea::selection{background:var(--sel-bg); color:var(--sel-fg)}
+input::-moz-selection,textarea::-moz-selection{background:var(--sel-bg); color:var(--sel-fg)}
 
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -380,7 +406,210 @@ pre{margin:0; background:var(--raise); border:1px solid var(--line); border-radi
 .dl.add{background:color-mix(in srgb,var(--ok) 15%,transparent); color:var(--ok)}
 .dl.del{background:color-mix(in srgb,var(--alarm) 14%,transparent); color:var(--alarm)}
 .dl.hunk{background:var(--surface2); color:var(--fg-dim)}
+/* Conflict rendering. The two sides are tinted by WHOSE they are rather than by add/remove,
+   because in a conflict both sides are additions and colouring them the same way is what
+   makes a conflict unreadable. */
+.dl.cmark{background:var(--alarm); color:#fff; font-weight:600}
+.dl.cours{background:color-mix(in srgb,var(--p4) 16%,transparent)}
+.dl.cbase{background:color-mix(in srgb,var(--fg-dim) 12%,transparent); color:var(--fg-dim)}
+.dl.ctheirs{background:color-mix(in srgb,var(--p0) 16%,transparent)}
+.diff.has-conflict{border-color:var(--alarm)}
+.cbanner{padding:10px 14px; border-bottom:1px solid var(--line); background:var(--surface);
+  font-size:12.5px; color:var(--fg-mid); line-height:1.6}
+.cbanner code{font-family:var(--mono); font-size:11px; background:var(--surface2); padding:1px 4px; border-radius:3px}
+
+/* A failure that knows the way out. Fixed rather than inline, because it can be raised from
+   a popover that is about to close, and persistent rather than timed, because three steps
+   take longer to read than a toast lasts. */
+.recovery{
+  position:fixed; right:20px; bottom:20px; z-index:60; width:min(430px,calc(100vw - 40px));
+  background:var(--raise); border:1px solid var(--alarm); border-left-width:3px;
+  border-radius:6px; box-shadow:var(--pop); padding:14px 16px;
+}
+.recovery .h{display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px}
+.recovery .why{font-size:13px; color:var(--fg); margin-bottom:10px; line-height:1.55}
+.recovery .steps{margin:0 0 10px; padding-left:20px; font-family:var(--mono); font-size:11px;
+  color:var(--fg-mid); line-height:1.85}
+.recovery .note{text-transform:none; letter-spacing:0; font-size:11.5px; line-height:1.5; margin-bottom:10px}
+.recovery .acts{display:flex; gap:8px}
+
+/* Mid-merge state, at the top of the Changes panel where it cannot be missed. */
+.mergebar{border-left:3px solid var(--alarm); background:var(--surface);
+  padding:10px 13px; margin-bottom:2px; display:flex; flex-direction:column; gap:6px}
+.mergebar .why{font-size:12.5px; color:var(--fg-mid); line-height:1.5}
+.mergebar .acts{display:flex; gap:6px; flex-wrap:wrap}
 .dl.meta{color:var(--fg-dim)}
+
+/* ═══ conflict resolution ═════════════════════════════════════════
+   One colour per side, everywhere, forever: the first block is --p4 and the second is --p0,
+   matching the tints the raw diff renderer already uses. If the sidebar, the legend, the
+   columns and the diff disagreed about which side is blue, the view would be actively worse
+   than reading the markers by hand.                                                       */
+.conflicts{display:flex; flex-direction:column; gap:14px; max-width:1400px}
+
+/* Which block is which. On a rebase this is the most important paragraph on the screen, so
+   it changes colour rather than politely matching everything else. */
+.cdir{border:1px solid var(--line); border-left-width:3px; border-radius:6px;
+  background:var(--surface); padding:11px 14px; display:flex; flex-direction:column; gap:5px}
+.cdir.swapped{border-color:var(--warn); background:color-mix(in srgb,var(--warn) 8%,var(--surface))}
+.cdir .why{font-size:13px; color:var(--fg); line-height:1.6; max-width:90ch}
+.cdir .why.note{font-size:12px; color:var(--fg-mid)}
+
+.clegend{display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:10px}
+.cside{border:1px solid var(--line); border-top-width:3px; border-radius:6px;
+  background:var(--raise); padding:10px 12px; display:flex; flex-direction:column; gap:3px; min-width:0}
+.cside.c-ours{border-top-color:var(--p4)}
+.cside.c-theirs{border-top-color:var(--p0)}
+.cside.c-base{border-top-color:var(--fg-dim)}
+.cside .k{font-family:var(--mono); font-size:9.5px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--fg-dim); display:flex; align-items:center; gap:6px}
+.cside .n{font-family:var(--mono); font-size:13px; color:var(--fg); font-weight:600;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.cside .r{font-size:12.5px; color:var(--fg-mid); line-height:1.45}
+.cside .m{font-size:11.5px; color:var(--fg-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.cside .m.sub{font-style:italic}
+.cside .hint{font-size:11.5px; color:var(--warn); line-height:1.45; margin-top:2px}
+.cside .mk{font-size:10.5px; color:var(--fg-dim); margin-top:3px}
+.cside .mk code, .chunk .mk code{font-family:var(--mono); font-size:10px;
+  background:var(--surface2); padding:1px 4px; border-radius:3px}
+
+/* Newer/older, stated rather than left to be worked out from two timestamps. */
+.agechip{font-family:var(--mono); font-size:9px; letter-spacing:.1em; text-transform:uppercase;
+  border:1px solid currentColor; border-radius:99px; padding:0 5px; line-height:1.5}
+.agechip.newer{color:var(--ok)}
+.agechip.older{color:var(--fg-dim)}
+
+.cfilehead{border:1px solid var(--line); border-radius:6px; background:var(--surface);
+  padding:11px 14px; display:flex; flex-direction:column; gap:8px}
+.cfilehead .top{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+.cfilehead .t{font-family:var(--mono); font-size:13px; color:var(--fg); overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap}
+.cfilehead .acts{display:flex; gap:6px; flex-wrap:wrap}
+
+.chunk{border:1px solid var(--line); border-radius:6px; background:var(--raise); overflow:hidden}
+.chead{padding:8px 13px; border-bottom:1px solid var(--line-soft); background:var(--surface);
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+.chead .n{font-size:12.5px; font-weight:600; color:var(--fg)}
+/* Context lines are grey and quiet — they exist to locate the conflict, not to be read. */
+.cctx{margin:0; border:0; border-radius:0; background:var(--surface); color:var(--fg-dim);
+  font-size:11px; padding:4px 0; max-height:none; opacity:.8}
+
+.cbody{display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line-soft)}
+.cbody.three{grid-template-columns:1fr 1fr 1fr}
+@media (max-width:1000px){ .cbody, .cbody.three{grid-template-columns:1fr} }
+.cpane{background:var(--raise); display:flex; flex-direction:column; min-width:0; padding-bottom:9px}
+.cpane .ch{padding:7px 12px 3px; display:flex; align-items:center; gap:7px; min-width:0}
+.cpane .ch .n{font-family:var(--mono); font-size:11.5px; font-weight:600; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap}
+.cpane .rr{padding:0 12px 6px; font-size:11px; color:var(--fg-dim); line-height:1.4}
+.cpane pre{margin:0 0 8px; border:0; border-radius:0; font-size:11.5px; max-height:40vh;
+  overflow:auto; padding:0; flex:1 1 auto}
+.cpane .btn{margin:0 12px}
+/* The side tints, matching .dl.cours / .dl.ctheirs in the raw diff. */
+.cpane.c-ours .ch{color:var(--p4)} .cpane.c-ours pre{background:color-mix(in srgb,var(--p4) 10%,transparent)}
+.cpane.c-theirs .ch{color:var(--p0)} .cpane.c-theirs pre{background:color-mix(in srgb,var(--p0) 10%,transparent)}
+.cpane.c-base .ch{color:var(--fg-dim)} .cpane.c-base pre{background:color-mix(in srgb,var(--fg-dim) 8%,transparent)}
+
+.cacts{padding:9px 13px; border-top:1px solid var(--line-soft); display:flex; gap:6px; flex-wrap:wrap}
+
+/* Hand-editing. The textarea is monospace and tall because the thing being edited is code. */
+.chand{padding:11px 13px; border-top:1px solid var(--line-soft); background:var(--surface);
+  display:flex; flex-direction:column; gap:7px}
+.chand.whole{border:1px solid var(--line); border-radius:6px}
+.handedit{width:100%; font-family:var(--mono); font-size:11.5px; line-height:1.55;
+  border:1px solid var(--line); border-radius:4px; background:var(--raise); color:var(--fg);
+  padding:8px 10px; resize:vertical; white-space:pre; overflow-wrap:normal; tab-size:2}
+.handedit.tall{min-height:58vh}
+.chand .acts{display:flex; gap:6px; flex-wrap:wrap}
+
+/* A model suggestion. Bordered in the assistant's own colour so it never reads as something
+   the app decided, and never as something already applied. */
+.csuggest{margin:0; padding:11px 13px; border-top:1px solid var(--line-soft);
+  background:color-mix(in srgb,var(--p5) 7%,var(--surface));
+  display:flex; flex-direction:column; gap:7px}
+.csuggest.unsure{background:var(--surface)}
+.csuggest .h{display:flex; align-items:center; gap:9px; flex-wrap:wrap}
+.csuggest .h .n{font-size:12.5px; font-weight:600; color:var(--fg)}
+.csuggest .why{font-size:12.5px; color:var(--fg-mid); line-height:1.55; max-width:85ch}
+.csuggest .why.note{font-size:11.5px; color:var(--fg-dim)}
+.csuggest .acts{display:flex; gap:6px; flex-wrap:wrap}
+.cprev{margin:0; font-size:11.5px; max-height:34vh; overflow:auto;
+  border:1px dashed var(--line); border-radius:4px; padding:6px 0; background:var(--raise)}
+
+/* Ready-to-mark state — the one green thing in this view. */
+.cready{border:1px solid var(--ok); border-radius:6px; padding:12px 14px;
+  background:color-mix(in srgb,var(--ok) 8%,var(--surface)); font-size:13px; line-height:1.6}
+.cready b{color:var(--ok)}
+.cready .acts{display:flex; gap:6px; margin-top:10px; flex-wrap:wrap}
+
+/* Sidebar. */
+.cophead{padding:11px 12px; border-bottom:1px solid var(--line); background:var(--surface2);
+  display:flex; flex-direction:column; gap:3px}
+.cophead .t{font-size:12.5px; color:var(--fg); line-height:1.45}
+.cprog{padding:9px 12px; border-bottom:1px solid var(--line-soft); position:relative;
+  font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--fg-dim)}
+.cprog i{position:absolute; left:0; bottom:0; height:2px; background:var(--ok); transition:width .2s}
+.cfrow .tick{flex:0 0 auto; font-size:11px; color:var(--alarm); width:12px; text-align:center}
+.cfrow.done .tick{color:var(--ok)}
+.cfrow.done .p{color:var(--fg-dim); text-decoration:line-through; text-decoration-color:var(--line)}
+.cfrow .s.conf{color:var(--alarm)}
+.cfrow.done .s.conf{color:var(--ok)}
+/* Not a real disagreement — the two sides hold the same bytes. Deliberately not alarm-red:
+   the row still needs settling, but nothing is at stake in the choice. */
+.cfrow .s.conf.same{color:var(--fg-dim)}
+.csame{border:1px solid var(--line); border-left:3px solid var(--p3); border-radius:6px;
+  padding:11px 14px; background:color-mix(in srgb,var(--p3) 8%,var(--surface))}
+.csame b{color:var(--p3); font-size:13px}
+.csame .why{font-size:12.5px; color:var(--fg-mid); line-height:1.6; margin-top:4px; max-width:88ch}
+
+/* ═══ image previews ══════════════════════════════════════════════
+   A checkerboard, not a flat panel: most of these are sprites with transparency, and against
+   a solid background a transparent region is indistinguishable from a filled one of the same
+   colour. `image-rendering:pixelated` is the same argument — smoothing a 32×32 tile up to
+   preview size hides the single-pixel differences you are looking for.                     */
+.imgpane{border:1px solid var(--line); border-radius:6px; overflow:hidden; background:var(--raise)}
+.imgrow{display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; padding:14px}
+.imgrow.three{grid-template-columns:1fr 1fr 1fr}
+@media (max-width:1000px){ .imgrow.three{grid-template-columns:1fr} }
+.imgconflict{display:flex; flex-direction:column; gap:10px}
+.imgconflict .imgrow{padding:0}
+
+.imgcard{border:1px solid var(--line); border-top-width:3px; border-radius:6px;
+  background:var(--surface); display:flex; flex-direction:column; min-width:0; overflow:hidden}
+.imgcard.c-ours{border-top-color:var(--p4)}
+.imgcard.c-theirs{border-top-color:var(--p0)}
+.imgcard.c-base{border-top-color:var(--fg-dim)}
+.imgcard .ch{padding:8px 12px 6px; display:flex; flex-direction:column; gap:2px; min-width:0}
+.imgcard .ch .n{font-family:var(--mono); font-size:11.5px; font-weight:600; color:var(--fg);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.imgcard.c-ours .ch .n{color:var(--p4)}
+.imgcard.c-theirs .ch .n{color:var(--p0)}
+.imgcard .ch .lab{text-transform:none; letter-spacing:0; font-size:11px; font-family:var(--sans)}
+
+.imgbox{
+  display:flex; align-items:center; justify-content:center;
+  min-height:190px; max-height:52vh; padding:12px; overflow:auto;
+  background-color:var(--surface2);
+  background-image:
+    linear-gradient(45deg, color-mix(in srgb,var(--fg-dim) 14%,transparent) 25%, transparent 25%),
+    linear-gradient(-45deg, color-mix(in srgb,var(--fg-dim) 14%,transparent) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, color-mix(in srgb,var(--fg-dim) 14%,transparent) 75%),
+    linear-gradient(-45deg, transparent 75%, color-mix(in srgb,var(--fg-dim) 14%,transparent) 75%);
+  background-size:16px 16px;
+  background-position:0 0, 0 8px, 8px -8px, -8px 0;
+}
+.imgbox.empty{background-image:none; color:var(--fg-dim); font-size:12.5px; font-style:italic}
+.imgbox img{
+  max-width:100%; max-height:46vh; object-fit:contain;
+  /* Sprite work is the common case here, so keep pixels square rather than smoothing them. */
+  image-rendering:pixelated;
+  /* A 32×32 tile shown at 32px is unreadable; let small art scale up to something usable. */
+  min-width:min(96px,100%);
+}
+.imeta{display:flex; justify-content:space-between; gap:8px; padding:7px 12px;
+  font-family:var(--mono); font-size:10.5px; color:var(--fg-dim); border-top:1px solid var(--line-soft)}
+.imeta.warn{color:var(--warn); justify-content:flex-start; line-height:1.45; font-family:var(--sans); font-size:11px}
+.iact{padding:0 12px 10px}
 
 .commits{display:flex; flex-direction:column; border:1px solid var(--line); border-radius:6px; overflow:hidden; background:var(--surface)}
 .crow{display:grid; grid-template-columns:74px 1fr auto; gap:12px; padding:9px 14px;
@@ -447,7 +676,11 @@ pre{margin:0; background:var(--raise); border:1px solid var(--line); border-radi
 .prop .move{font-family:var(--mono); font-size:11.5px; color:var(--fg-mid)}
 .prop .move b{color:var(--c,var(--fg))}
 .conf{font-family:var(--mono); font-size:9.5px; letter-spacing:.08em; text-transform:uppercase;
-  padding:2px 7px; border-radius:9px; border:1px solid var(--line); white-space:nowrap}
+  padding:2px 7px; border-radius:9px; border:1px solid var(--line); white-space:nowrap;
+  display:inline-flex; gap:5px; align-items:baseline}
+/* The metric name is what the number means, so it is quieter than the number but never
+   absent — a bare percentage beside a proposal tells you nothing about what it measures. */
+.conf .metric{color:var(--fg-dim); font-size:8.5px; letter-spacing:.1em}
 .conf.hi{border-color:var(--ok); color:var(--ok)}
 .conf.mid{border-color:var(--warn); color:var(--warn)}
 .conf.lo{border-color:var(--alarm); color:var(--alarm)}
@@ -622,3 +855,58 @@ pre{margin:0; background:var(--raise); border:1px solid var(--line); border-radi
 .pal-row .hint{font-family:var(--mono); font-size:10.5px; color:var(--fg-dim); white-space:nowrap}
 .pal-foot{border-top:1px solid var(--line-soft); padding:8px 14px}
 @media (max-width:640px){ .pal-overlay{padding:6vh 8px 8px} .pal-row .hint{display:none} }
+
+/* Live assistant progress. The model is slow enough that "working…" for two minutes reads
+   as a hang, so the rail says which action, how far through, and what it is touching now. */
+.jobrow{border:1px solid var(--line); border-radius:5px; padding:8px 10px; background:var(--surface);
+  display:flex; flex-direction:column; gap:5px; margin:2px 0 4px}
+.jobrow .jt{display:flex; justify-content:space-between; align-items:baseline; gap:8px; font-size:12.5px}
+.jobrow .js{font-family:var(--mono); font-size:10.5px; color:var(--fg-dim);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.jbar{position:relative; height:4px; background:var(--surface2); border-radius:2px}
+.jbar i{display:block; height:100%; background:var(--fill); border-radius:2px; transition:width .3s ease}
+.jbar .lab{position:absolute; right:0; top:6px; font-size:9px}
+
+/* Dependency graph. Direction is carried by position and arrowheads: what blocks this issue
+   sits above it, what waits on it sits below. */
+.depwrap{margin:6px 0 10px}
+.depgraph{display:block; max-width:100%; overflow:visible}
+.depnode rect{fill:var(--surface); stroke:var(--line); stroke-width:1}
+.depnode text{font-family:var(--mono); pointer-events:none}
+.depnode .dn{font-size:10px; fill:var(--fg-mid)}
+.depnode .dt{font-size:9.5px; fill:var(--fg-dim)}
+.depnode[role="button"]{cursor:pointer}
+.depnode[role="button"]:hover rect{stroke:var(--fill); fill:var(--surface2)}
+.depnode[role="button"]:focus-visible rect{stroke:var(--fill); stroke-width:2}
+.depnode.up rect{stroke:var(--alarm)}
+.depnode.down rect{stroke:var(--p3)}
+.depnode.self rect{fill:var(--raise); stroke:var(--fill); stroke-width:2}
+.depnode.self .dn{fill:var(--fg); font-weight:600}
+.deplegend{text-transform:none; letter-spacing:0; margin-top:2px}
+/* A dependency edge is a fact from the issue body; a similarity score is a guess. The chip
+   says which, so the two never read as the same kind of claim. */
+.why-chip.dep{background:color-mix(in srgb,var(--p3) 20%,transparent); color:var(--fg-mid);
+  font-family:var(--mono); font-size:9.5px; padding:2px 6px; border-radius:9px; white-space:nowrap}
+
+/* Settings: folded-away advanced fields, and the one-line hints under a control. */
+.hint-line{text-transform:none; letter-spacing:0; font-size:11px; line-height:1.45; color:var(--fg-dim)}
+.rail details{border:1px solid var(--line); border-radius:5px; background:var(--surface); margin-top:4px}
+.rail details > summary{padding:8px 11px; cursor:pointer; font-size:12.5px; color:var(--fg-mid)}
+.rail details > summary:hover{color:var(--fg)}
+.rail details .fold{padding:0 11px 11px; display:flex; flex-direction:column; gap:9px}
+
+/* The Plan's dependency section. The tracker graph is wider than the issue-detail one, so it
+   scrolls sideways inside its own box rather than stretching the pane. */
+.deps-note{color:var(--fg-mid); margin:0 0 12px; max-width:62ch; line-height:1.6; font-size:13.5px}
+.deps-note code{font-family:var(--mono); font-size:11.5px; background:var(--surface2);
+  padding:1px 5px; border-radius:3px}
+.depgraph.tracker{min-width:420px}
+.depwrap:has(.tracker){overflow-x:auto; padding-bottom:4px; margin-bottom:22px}
+
+/* A proposed dependency edge. Styled apart from the graph on purpose: the graph is what the
+   tracker records, a card is a suggestion nobody has accepted yet, and the two must never
+   read as the same kind of claim. */
+.prop.dep{border-left-color:var(--p3)}
+.prop.dep .why{color:var(--fg-mid); font-size:12.5px; line-height:1.55; margin:6px 0 2px}
+.prop.dep .relrow{margin-top:6px}
+.depprops{margin-bottom:22px}
