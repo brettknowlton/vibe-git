@@ -32,6 +32,8 @@
       <span class="remote" id="remote-badge" hidden></span>
       <span class="led" id="led" title="connection"></span>
       <span class="lab" id="stamp"></span>
+      <button class="btn sm" id="btn-theme" title="Theme: following your system setting"
+              aria-label="Theme">◐</button>
       <button class="btn sm" id="btn-refresh" title="Reload everything from git and GitHub">Refresh</button>
       <button class="btn sm" id="btn-ai" aria-expanded="false" aria-controls="ai-panel"
               title="Assistant — runs alongside whatever else you're doing">Assistant <span id="ai-pip"></span></button>
@@ -44,6 +46,8 @@
         <button data-view="issues"  aria-current="true">Issues        <span class="count" id="c-issues">—</span></button>
         <button data-view="plan"    aria-current="false">Plan          <span class="count" id="c-plan">—</span></button>
         <button data-view="changes" aria-current="false">Changes       <span class="count" id="c-changes">—</span></button>
+        <!-- Only present while a merge is half-finished; renderNav() shows and hides it. -->
+        <button data-view="conflicts" id="nav-conflicts" aria-current="false" hidden>Conflicts     <span class="count" id="c-conflicts">0</span></button>
         <button data-view="history" aria-current="false">History       <span class="count" id="c-history">—</span></button>
         <button data-view="prs"     aria-current="false">Pull requests <span class="count" id="c-prs">—</span></button>
         <button data-view="staged"  aria-current="false">Staged        <span class="count" id="c-staged">0</span></button>

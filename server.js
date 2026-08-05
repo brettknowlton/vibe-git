@@ -32,6 +32,8 @@ const { URL } = require('url');
 
 const ex = require('./lib/exec');
 const gitOps = require('./lib/git');
+const conflicts = require('./lib/conflicts');
+const images = require('./lib/images');
 const issueOps = require('./lib/issues');
 const {
   Repos, CONFIG_DIR, LEGACY_CONFIG_DIR, readConfig, writeConfig,
@@ -44,6 +46,7 @@ const assistant = require('./lib/assistant');
 const { Jobs, isCancel } = require('./lib/jobs');
 const { createAccess, AccessError } = require('./lib/access');
 const search = require('./lib/search');
+const workspace = require('./lib/workspace');
 
 const HERE = __dirname;
 const WEB = path.join(HERE, 'web');
@@ -61,7 +64,7 @@ const CSP_NONCE = crypto.randomBytes(18).toString('base64');
  *
  * BUMP IT whenever you add, remove or rename a route.
  */
-const API_VERSION = 3;
+const API_VERSION = 6;
 
 // Repository slugs become local cache filenames. Replace every separator and collapse
 // dot-dot so even a malformed hand-edited remote cannot escape the intended directory.
@@ -163,8 +166,22 @@ const jobs = new Jobs();
  * Cancel works from the moment the request is sent, not from the moment a reply comes
  * back — which for a 30B model on a first token can be tens of seconds.
  */
+const JOB_LABELS = {
+  classify: 'Classifying issues',
+  suggest: 'Looking for missing issues',
+  milestones: 'Proposing milestones',
+  plan: 'Building the plan',
+  'plan-update': 'Updating the plan',
+  index: 'Embedding issues',
+  chat: 'Answering',
+  'commit-summary': 'Drafting a commit message',
+  conflict: 'Reading the conflict',
+};
+
 async function underJob(body, kind, fn) {
-  const signal = jobs.start(body && body.jobId, kind);
+  // The label is what the status line says out loud. Without it every running job read as
+  // "working…", which is exactly as informative as a spinner and no more.
+  const signal = jobs.start(body && body.jobId, kind, JOB_LABELS[kind] || kind);
   try { return await fn(signal); }
   finally { jobs.finish(signal); }
 }
@@ -233,20 +250,38 @@ async function metaFor(dir, { fresh = false } = {}) {
 
 const issueCache = new Map();   // dir -> { issues, truncated, at }
 
-/* AI is opt-in and off until configured. Nothing here runs unless the user turns it on. */
+/*
+ * AI is opt-in and off until configured. Nothing here runs unless the user turns it on.
+ *
+ * `provider` is normally 'auto': lib/providers.js probes the endpoint and decides whether it
+ * is Ollama, an OpenAI-compatible server, or Anthropic. The embed* fields exist because the
+ * two halves need not live together — Anthropic has no embedding API at all, and pairing a
+ * hosted chat model with a local embedder keeps every issue body on this machine.
+ *
+ * THE KEY NEVER LEAVES THIS FUNCTION TOWARDS THE BROWSER. Every route that reports config
+ * back sends providers.redact(cfg) instead.
+ */
 function aiConfig() {
   const c = readConfig().ai || {};
   return {
     enabled: !!c.enabled,
+    provider: llm.providers.PROVIDER_IDS.includes(c.provider) ? c.provider : 'auto',
     endpoint: c.endpoint || llm.DEFAULT_ENDPOINT,
+    apiKey: c.apiKey || null,
     model: c.model || null,
     embedModel: c.embedModel || null,
+    embedProvider: llm.providers.PROVIDER_IDS.includes(c.embedProvider) ? c.embedProvider : 'auto',
+    embedEndpoint: c.embedEndpoint || null,
+    embedApiKey: c.embedApiKey || null,
     concurrency: c.concurrency || 2,
     temperature: c.temperature == null ? 0 : c.temperature,
     timeoutMs: c.timeoutMs || 300000,
     numCtx: c.numCtx || 8192,
   };
 }
+
+/* The config as the front-end is allowed to see it. */
+const safeAiConfig = () => llm.providers.redact(aiConfig());
 
 /*
  * Chat carries tool definitions, tool output and a running transcript, so it needs far
@@ -422,7 +457,7 @@ async function buildState({ fresh = false } = {}) {
 
   const dir = sel.path;
   // Git is local and effectively instant; GitHub may be absent (no remote, or not authed).
-  const [st, br, hist, stash] = await Promise.all([
+  const [st, br, hist, stash, mergeState] = await Promise.all([
     gitOps.status(dir),
     gitOps.branches(dir).catch(() => ({ current: null, local: [], remote: [], remoteOnly: [] })),
     gitOps.log(dir, 40).catch(() => []),
@@ -430,6 +465,9 @@ async function buildState({ fresh = false } = {}) {
     // says it exists, and the moment you most need to be told is on a clean tree — which
     // is exactly when the Changes view had nothing to show.
     gitOps.stash(dir, 'list').catch(() => ({ stashes: [] })),
+    // A half-finished merge is invisible in `status` alone — you see conflicted files with
+    // no explanation of what put them there, and no hint that aborting is available.
+    gitOps.mergeState(dir).catch(() => ({ inProgress: false, kind: null })),
   ]);
 
   let github = null, githubError = null;
@@ -458,7 +496,10 @@ async function buildState({ fresh = false } = {}) {
     ? planOps.assignIssuePhases(cache.issues, livePhases)
     : cache.issues) : [];
   return Object.assign(base, {
-    git: { status: st, branches: br, log: hist, stashes: (stash && stash.stashes) || [] },
+    git: {
+      status: st, branches: br, log: hist,
+      stashes: (stash && stash.stashes) || [], merge: mergeState,
+    },
     github, githubError,
     issues,
     truncated: cache ? cache.truncated : false,
@@ -625,6 +666,48 @@ const routes = {
   'POST /api/git/amend': async (_q, body) => withRepo(dir => gitOps.amendCommit(dir, body)),
   'POST /api/git/stash': async (_q, body) => withRepo(dir => gitOps.stash(dir, String(body.action || ''), body.ref)),
   'POST /api/git/merge': async (_q, body) => withRepo(dir => gitOps.merge(dir, body.branch)),
+  'POST /api/git/merge-abort': async () => withRepo(dir => gitOps.abortMerge(dir)),
+
+  /*
+   * ── conflict resolution ────────────────────────────────────────
+   *
+   * Reads are cheap and are called on every render of the Conflicts view. Writes touch the
+   * working tree, so each one re-validates its path against what git reports as unmerged at
+   * that instant rather than trusting the path the browser sends back.
+   */
+  'GET /api/git/conflicts': async () => withRepo(dir => conflicts.state(dir)),
+  'GET /api/git/conflict': async (q) => withRepo(dir => conflicts.file(dir, q.get('file'))),
+  'POST /api/git/conflict/hunks': async (_q, body) => withRepo(dir =>
+    conflicts.resolveHunks(dir, body.file, body.choices, { expect: body.fingerprint || null })),
+  'POST /api/git/conflict/file': async (_q, body) => withRepo(dir =>
+    conflicts.resolveFile(dir, body.file, body.option)),
+  'POST /api/git/conflict/text': async (_q, body) => withRepo(dir =>
+    conflicts.resolveText(dir, body.file, body.text,
+      { expect: body.fingerprint || null, force: !!body.force })),
+  'POST /api/git/conflict/reopen': async (_q, body) => withRepo(dir =>
+    conflicts.reopen(dir, body.file, { withAncestor: !!body.withAncestor })),
+  'POST /api/git/conflict/mark': async (_q, body) => withRepo(dir =>
+    conflicts.markResolved(dir, body.files)),
+  'POST /api/git/conflict/continue': async (_q, body) => withRepo(dir =>
+    conflicts.proceed(dir, { subject: body.subject, body: body.body })),
+  'POST /api/git/conflict/skip': async () => withRepo(dir => conflicts.skip(dir)),
+  /*
+   * The assistant reads the conflict and proposes; it never writes. What comes back is a
+   * suggestion per conflict that the person applies with the same button they would have
+   * used anyway — so an accepted suggestion and a hand-made choice take the identical path.
+   */
+  'POST /api/ai/resolve-conflict': async (_q, body) => withRepo(async (dir) => {
+    const cfg = requireAi();
+    const ctx = await conflicts.aiContext(dir, body.file, body.hunk);
+    const draft = await underJob(body, 'conflict', (signal) => llm.resolveConflict(cfg, ctx, signal));
+    return Object.assign({ ok: true, file: ctx.path }, draft, {
+      message: `Read ${ctx.hunks.length} conflict${ctx.hunks.length === 1 ? '' : 's'} in ${ctx.path}` +
+        (ctx.truncated ? ' (the rest were left for a second pass)' : ''),
+    });
+  }),
+  /* The way out of a failed fast-forward pull, as one action instead of three commands. */
+  'POST /api/git/recover': async (_q, body) => withRepo(dir =>
+    gitOps.recover(dir, String(body.action || ''))),
   'GET /api/git/tags': async () => withRepo(async dir => ({ ok: true, tags: await gitOps.tags(dir) })),
   'POST /api/git/tag': async (_q, body) => withRepo(dir => gitOps.createTag(dir, body)),
   'POST /api/git/branch-delete': async (_q, body) => withRepo(dir =>
@@ -656,6 +739,38 @@ const routes = {
 
   'POST /api/git/discard': async (_q, body) => withRepo(dir => gitOps.discard(dir, body.paths)),
   'GET /api/git/diff': async (q) => withRepo(dir => gitOps.fileDiff(dir, q.get('file'))),
+
+  /*
+   * ── image previews ─────────────────────────────────────────────
+   *
+   * Pictures come back as base64 data URIs in JSON rather than from a route that serves
+   * bytes, so the page's `img-src data:` CSP does not have to be widened. A same-origin
+   * endpoint returning a Content-Type derived from a filename inside a repository would be a
+   * larger surface than this feature is worth.
+   *
+   * The path is validated the same way every other file route validates: it must be
+   * something git JUST reported as a change or as unmerged. `sides` decides which versions,
+   * and is what makes one endpoint serve both the Changes pane (HEAD vs working tree) and
+   * the Conflicts pane (the three recorded stages).
+   */
+  'GET /api/git/image': async (q) => withRepo(async (dir) => {
+    const file = String(q.get('file') || '');
+    if (!images.isImage(file)) throw new HttpError(400, 'That file is not a previewable image');
+    const sides = String(q.get('sides') || 'head,worktree').split(',').map(s => s.trim()).filter(Boolean);
+    // Membership in one of git's own live lists is the boundary. A conflicted path is not in
+    // the ordinary changes list, so both are consulted before anything is read.
+    const [status, unmerged] = await Promise.all([
+      gitOps.status(dir),
+      conflicts.unmergedFiles(dir).catch(() => []),
+    ]);
+    const known = new Set([...status.files.map(f => f.path), ...unmerged.map(f => f.path)]);
+    if (!known.has(file)) throw new HttpError(400, `"${file}" is not one of the current changes`);
+    return {
+      ok: true, file,
+      versions: await images.compare(dir, file, sides),
+      max: images.MAX_PREVIEW,
+    };
+  }),
 
   /* Staging must be instant — it validates against cached metadata, never re-fetches. */
   'POST /api/queue/add': async (_q, body) => withRepo(async (dir) => {
@@ -766,47 +881,74 @@ const routes = {
   }),
 
   'GET /api/ai/status': async () => {
-    const cfg = aiConfig();
-    const st = await llm.status(cfg.endpoint);
-    return Object.assign(st, { config: cfg });
+    const st = await llm.status(aiConfig());
+    return Object.assign(st, { config: safeAiConfig() });
   },
   'POST /api/ai/config': async (_q, body) => {
-    // Validate the endpoint before persisting it, so a bad scheme can't be saved at all.
-    if (body.endpoint) {
+    // Validate every endpoint before persisting it, so a bad scheme can't be saved at all.
+    const checkUrl = (value, what) => {
       let u;
-      try { u = new URL(String(body.endpoint).trim()); }
-      catch { throw new HttpError(400, 'That is not a valid URL'); }
+      try { u = new URL(String(value).trim()); }
+      catch { throw new HttpError(400, `${what} is not a valid URL`); }
       if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-        throw new HttpError(400, 'The AI endpoint must be http:// or https:// — got ' + u.protocol);
+        throw new HttpError(400, `${what} must be http:// or https:// — got ` + u.protocol);
       }
-    }
+      return u.href.replace(/\/+$/, '');
+    };
+    if (body.endpoint) checkUrl(body.endpoint, 'The AI endpoint');
+    if (body.embedEndpoint) checkUrl(body.embedEndpoint, 'The embedding endpoint');
+    const pickProvider = (value, fallback) => {
+      if (value === undefined) return fallback;
+      const v = String(value || 'auto');
+      if (!llm.providers.PROVIDER_IDS.includes(v)) {
+        throw new HttpError(400, `Unknown provider "${v}" — use one of ${llm.providers.PROVIDER_IDS.join(', ')}`);
+      }
+      return v;
+    };
+    /*
+     * A key field arriving as the redaction marker means "leave it alone" — the settings
+     * panel round-trips what it was shown, and it is never shown the real value.
+     */
+    const pickKey = (value, fallback) => {
+      if (value === undefined) return fallback;
+      const v = String(value == null ? '' : value).trim();
+      if (!v) return null;
+      if (/^[•*]+$/.test(v)) return fallback;
+      return v;
+    };
     const cur = readConfig();
-    const ai = Object.assign({}, cur.ai || {}, {
-      enabled: body.enabled === undefined ? !!(cur.ai && cur.ai.enabled) : !!body.enabled,
-      endpoint: body.endpoint ? String(body.endpoint).trim() : (cur.ai && cur.ai.endpoint) || llm.DEFAULT_ENDPOINT,
-      model: body.model === undefined ? (cur.ai && cur.ai.model) || null : (body.model || null),
-      embedModel: body.embedModel === undefined ? (cur.ai && cur.ai.embedModel) || null : (body.embedModel || null),
-      concurrency: Math.max(1, Math.min(Number(body.concurrency) || (cur.ai && cur.ai.concurrency) || 2, 8)),
-      temperature: body.temperature == null ? ((cur.ai && cur.ai.temperature) || 0) : Math.max(0, Math.min(Number(body.temperature), 1)),
-      timeoutMs: Math.max(10000, Math.min(Number(body.timeoutMs) || (cur.ai && cur.ai.timeoutMs) || 300000, 1800000)),
-      numCtx: Math.max(2048, Math.min(Number(body.numCtx) || (cur.ai && cur.ai.numCtx) || 8192, 131072)),
+    const old = cur.ai || {};
+    const ai = Object.assign({}, old, {
+      enabled: body.enabled === undefined ? !!old.enabled : !!body.enabled,
+      provider: pickProvider(body.provider, old.provider || 'auto'),
+      endpoint: body.endpoint ? String(body.endpoint).trim().replace(/\/+$/, '') : old.endpoint || llm.DEFAULT_ENDPOINT,
+      apiKey: pickKey(body.apiKey, old.apiKey || null),
+      model: body.model === undefined ? old.model || null : (body.model || null),
+      embedModel: body.embedModel === undefined ? old.embedModel || null : (body.embedModel || null),
+      embedProvider: pickProvider(body.embedProvider, old.embedProvider || 'auto'),
+      embedEndpoint: body.embedEndpoint === undefined
+        ? old.embedEndpoint || null
+        : (String(body.embedEndpoint || '').trim().replace(/\/+$/, '') || null),
+      embedApiKey: pickKey(body.embedApiKey, old.embedApiKey || null),
+      concurrency: Math.max(1, Math.min(Number(body.concurrency) || old.concurrency || 2, 8)),
+      temperature: body.temperature == null ? (old.temperature || 0) : Math.max(0, Math.min(Number(body.temperature), 1)),
+      timeoutMs: Math.max(10000, Math.min(Number(body.timeoutMs) || old.timeoutMs || 300000, 1800000)),
+      numCtx: Math.max(2048, Math.min(Number(body.numCtx) || old.numCtx || 8192, 131072)),
     });
     // Switching models evicts the old one rather than leaving two competing for VRAM.
-    const prev = (cur.ai && cur.ai.model) || null;
+    // Endpoints with no notion of residency report `skipped` and nothing is claimed.
     const unloaded = [];
-    if (prev && prev !== ai.model) {
-      const r = await llm.unload(ai.endpoint, prev);
+    for (const [prev, next] of [[old.model, ai.model], [old.embedModel, ai.embedModel]]) {
+      if (!prev || prev === next) continue;
+      const r = await llm.unload(ai, prev);
       if (r.ok) unloaded.push(prev);
     }
-    const prevEmbed = (cur.ai && cur.ai.embedModel) || null;
-    if (prevEmbed && prevEmbed !== ai.embedModel) {
-      const r = await llm.unload(ai.endpoint, prevEmbed);
-      if (r.ok) unloaded.push(prevEmbed);
-    }
     writeConfig(Object.assign(cur, { ai }));
-    const st = await llm.status(ai.endpoint);
+    // The endpoint may now point at a different kind of server; drop the cached dialect.
+    llm.providers.forget();
+    const st = await llm.status(aiConfig());
     return Object.assign(st, {
-      config: aiConfig(), ok: true,
+      config: safeAiConfig(), ok: true,
       message: 'AI settings saved' + (unloaded.length ? ' · unloaded ' + unloaded.join(', ') : ''),
     });
   },
@@ -815,9 +957,18 @@ const routes = {
     const cfg = aiConfig();
     const targets = body.model ? [String(body.model)] : [cfg.model, cfg.embedModel].filter(Boolean);
     const done = [];
-    for (const m of targets) { const r = await llm.unload(cfg.endpoint, m); if (r.ok) done.push(m); }
-    const st = await llm.status(cfg.endpoint);
-    return Object.assign(st, { ok: true, config: cfg, message: done.length ? 'Unloaded ' + done.join(', ') : 'Nothing was loaded' });
+    const skipped = [];
+    for (const m of targets) {
+      const r = await llm.unload(cfg, m);
+      if (r.ok) done.push(m); else if (r.skipped) skipped.push(m);
+    }
+    const st = await llm.status(cfg);
+    return Object.assign(st, {
+      ok: true, config: safeAiConfig(),
+      message: done.length ? 'Unloaded ' + done.join(', ')
+        : skipped.length ? 'This endpoint keeps no models resident — nothing to unload'
+          : 'Nothing was loaded',
+    });
   },
 
   'GET /api/auth': async () => { AUTH = await issueOps.authStatus(repos.selected && repos.selected.path); return AUTH; },
@@ -916,6 +1067,18 @@ const routes = {
     const requestedCount = revising && Number(existing.requestedCount)
       ? Math.max(3, Math.min(Number(existing.requestedCount), llm.PLAN_MAX))
       : Math.max(3, Math.min(Number(body.count) || 10, llm.PLAN_MAX));
+    /*
+     * Two switches for the two kinds of thing a plan adds beyond the ordering itself.
+     * Somebody who asked for a plan and got five invented issues alongside it did not get
+     * what they asked for, so both are answerable per run — and an update keeps whatever the
+     * plan was built with, because changing it silently would be the same surprise again.
+     */
+    const requestedGaps = revising && existing.requestedGaps != null
+      ? Math.max(0, Math.min(Number(existing.requestedGaps), 10))
+      : (body.gapCount == null ? 5 : Math.max(0, Math.min(Number(body.gapCount), 10)));
+    const requestedDeps = revising && existing.requestedDeps != null
+      ? existing.requestedDeps !== false
+      : body.deps !== false;
 
     /*
      * A plan may be asked to cover one milestone, one label, or both — which is how two
@@ -951,6 +1114,9 @@ const routes = {
     // avoid proposing duplicates. planInsights bills them at a title each, not a body.
     const planningIssues = candidates.concat(scoped.filter(issue => issue.st !== 'OPEN'));
     const drift = planStatus(slug, cache.issues);
+    // The repository's own file list, so a gap proposal has to survive contact with what the
+    // project already contains rather than only with what the tracker says it lacks.
+    const fileMap = await workspace.fileMap(dir).catch(() => null);
     const generated = await underJob(body, revising ? 'plan-update' : 'plan', (signal) =>
       llm.planInsights(cfg, {
         issues: planningIssues,
@@ -958,10 +1124,12 @@ const routes = {
         labels: m.labels,
         planText: planFor(dir),
         count: requestedCount,
-        gapCount: 5,
+        gapCount: requestedGaps,
+        wantDeps: requestedDeps,
         scope,
         currentPlan: revising ? existing : null,
         changed: revising ? { added: drift.added, closed: drift.closed } : null,
+        fileMap,
       }, signal));
     const gaps = planOps.normalizeGeneratedGaps(generated.gaps, {
       milestones: m.milestones,
@@ -969,11 +1137,20 @@ const routes = {
       issues: cache.issues,
       labels: m.labels,
       ignoredTitles: loadIgnored(slug),
-      limit: 5,
+      limit: requestedGaps,
       maxPriority: requestedCount,
       scope,
     });
     const editorial = planOps.mergeRankedGaps(generated.ranked, gaps);
+    // Edges are checked against the live tracker, not against what the model was shown: a
+    // stale number, a closed issue or a loop all have to be dropped here rather than drawn.
+    const { deps, rejected: depsRejected } = search.normalizeDeps(generated.deps, {
+      issues: cache.issues,
+    });
+    if (depsRejected.length) {
+      console.error(`  ! dropped ${depsRejected.length} proposed dependenc(ies): ` +
+        depsRejected.map(r => r.reason).join('; ').slice(0, 300));
+    }
     // Persist only the model's editorial contribution. Dates, milestone membership,
     // completion, fallback entries, and milestone order are derived from GitHub on read.
     const saved = {
@@ -983,6 +1160,8 @@ const routes = {
       capturedAt: new Date().toISOString().slice(0, 10),
       generated: true,
       requestedCount,
+      requestedGaps,
+      requestedDeps,
       scope,
       // Both lists are what staleness is measured against later: everything the plan saw,
       // and the subset it considered outstanding — so they are the scoped issues, not the
@@ -991,6 +1170,9 @@ const routes = {
       baselineOpen: scoped.filter(i => i.st === 'OPEN').map(i => i.n),
       ranked: editorial,
       gaps,
+      // Proposals, like the gaps: they become real only when the user stages and pushes the
+      // body edit that records them.
+      deps,
     };
     try {
       fs.mkdirSync(path.join(CONFIG_DIR, 'plans'), { recursive: true });
@@ -999,7 +1181,8 @@ const routes = {
     const plan = planOps.hydratePlan(saved, m.milestones, cache.issues);
     return {
       ok: true, plan, planStatus: planStatus(slug, cache.issues),
-      message: `${revising ? 'Updated' : 'Built'} a ${plan.ranked.length}-step plan with ${gaps.length} missing-work insight${gaps.length === 1 ? '' : 's'} ` +
+      message: `${revising ? 'Updated' : 'Built'} a ${plan.ranked.length}-step plan with ${gaps.length} missing-work insight${gaps.length === 1 ? '' : 's'}` +
+        (deps.length ? ` and ${deps.length} dependenc${deps.length === 1 ? 'y' : 'ies'}` : '') + ' ' +
         (scope
           ? `for ${planOps.scopeText(scope)}`
           : `from ${phases.length} milestone${phases.length === 1 ? '' : 's'}`) +
@@ -1056,14 +1239,18 @@ const routes = {
     }
     const t0 = Date.now();
     const out = await llm.classify(cfg,
-      { issues: pick, milestones: m.milestones, labels: m.labels, corpus }, signal);
-    const { proposals, newMilestones, newLabels } = out;
+      // allIssues is the whole tracker: a batch of unclassified issues can legitimately be
+      // blocked by classified ones, which are not in `pick`.
+      { issues: pick, milestones: m.milestones, labels: m.labels, corpus, allIssues: cache.issues },
+      signal);
+    const { proposals, newMilestones, newLabels, deps } = out;
     const n = proposals.filter(p => p.changed).length;
     const nominated = newMilestones.length + newLabels.length;
     return {
-      ok: true, proposals, newMilestones, newLabels, retrieved,
+      ok: true, proposals, newMilestones, newLabels, deps, retrieved,
       message: `Classified ${pick.length} issue${pick.length === 1 ? '' : 's'} in ${((Date.now() - t0) / 1000).toFixed(0)}s — ${n} suggested change${n === 1 ? '' : 's'}` +
         (nominated ? ` · nominated ${nominated} new categor${nominated === 1 ? 'y' : 'ies'}` : '') +
+        (deps.length ? ` · found ${deps.length} dependenc${deps.length === 1 ? 'y' : 'ies'}` : '') +
         (retrieved ? ` · used ${corpus.length} similar issues as precedent` : ''),
     };
   })),
@@ -1100,6 +1287,7 @@ const routes = {
     const suggestions = await llm.suggest(cfg, {
       issues: cache ? cache.issues : [], milestones: m.milestones, labels: m.labels,
       planText, count: Number(body.count) || 5, corpusVecs,
+      fileMap: await workspace.fileMap(dir).catch(() => null),
     }, signal);
     const before = suggestions.length;
     const kept = suggestions.filter(x => !ignored.some(g => ignKey(g.title) === ignKey(x.title)));
@@ -1131,6 +1319,9 @@ const routes = {
     const ctx = {
       repo: (meta && meta.repo) || repos.selected.github || repos.selected.name,
       name: repos.selected.name,
+      // The working tree, so the assistant can check whether an open issue is already built
+      // instead of inferring it from the tracker — see lib/workspace.js.
+      dir,
       issues,
       issuesLoaded: !!cache,
       milestones: (meta && meta.milestones) || [],
@@ -1165,6 +1356,14 @@ const routes = {
         (out.proposals.length ? ` · ${out.proposals.length} proposal${out.proposals.length === 1 ? '' : 's'}` : ''),
     });
   })),
+
+  /*
+   * What the assistant is doing right now. Deliberately its own tiny route rather than part
+   * of /api/state: it is polled every second or so while work is in flight, and rebuilding
+   * the whole state — git, metadata, insights — at that rate to read four fields would be
+   * absurd. Reads live objects only; no subprocess, no model call.
+   */
+  'GET /api/ai/jobs': async () => ({ ok: true, jobs: jobs.active() }),
 
   'GET /api/dry-log': async () => ({ dryRun: ex.isDryRun(), entries: ex.dryLog() }),
 };
@@ -1258,9 +1457,17 @@ function serveStatic(res, entry, who) {
       user: (who && who.user) || null,
     })
       .replace(/</g, '\\u003c');               // cannot break out of the script element
+    /*
+     * The theme is applied in the boot script rather than in app.js, which loads at the end
+     * of <body>. Anything later than this repaints AFTER first paint, so choosing dark on a
+     * light system meant a white flash on every reload. The value is read from localStorage
+     * and validated here, because it is the one piece of state the server does not own.
+     */
+    const themeBoot = "(function(){try{var t=localStorage.getItem('vibe-git.theme');" +
+      "if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}})();";
     body = body
       .replace('/*BOOT_NONCE*/', CSP_NONCE)
-      .replace('/*BOOT*/', 'window.__VIBE_GIT__=' + boot + ';');
+      .replace('/*BOOT*/', 'window.__VIBE_GIT__=' + boot + ';' + themeBoot);
   }
   const buf = Buffer.from(body);
   res.writeHead(200, {
@@ -1313,7 +1520,11 @@ const server = http.createServer(async (req, res) => {
     }
     const status = (err instanceof HttpError) ? err.status : ((err && err.status) || 500);
     if (status >= 500) console.error('  ! ' + ((err && err.stack) || err));
-    return sendJson(res, status, { error: String((err && err.message) || 'Unknown error') });
+    const out = { error: String((err && err.message) || 'Unknown error') };
+    // Some failures know the way out of themselves — see lib/git.js RecoverableError. The
+    // recipe travels with the error rather than being reconstructed from its wording.
+    if (err && err.recovery) out.recovery = err.recovery;
+    return sendJson(res, status, out);
   }
 });
 

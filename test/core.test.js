@@ -14,6 +14,8 @@ const { refName, posInt, text } = require('../lib/exec');
 const { Repos, describe } = require('../lib/repos');
 const llm = require('../lib/llm');
 const gitOps = require('../lib/git');
+const conflicts = require('../lib/conflicts');
+const images = require('../lib/images');
 const {
   dateOnly, milestonePhases, assignIssuePhases, prioritizeIssues,
   completeRanking, normalizeGeneratedGaps, mergeRankedGaps,
@@ -196,7 +198,7 @@ test('assistant plan generation returns ranking and missing-work insights', asyn
   t.after(() => new Promise(resolve => mock.close(resolve)));
 
   const result = await llm.planInsights({
-    endpoint: `http://127.0.0.1:${mock.address().port}`, model: 'test-model', timeoutMs: 5000,
+    endpoint: `http://127.0.0.1:${mock.address().port}`, provider: 'ollama', model: 'test-model', timeoutMs: 5000,
   }, {
     issues: [
       { n: 1, t: 'First', st: 'OPEN', ms: 'Release', bx: [0, 0], bl: [], body: '' },
@@ -210,7 +212,7 @@ test('assistant plan generation returns ranking and missing-work insights', asyn
   assert.ok(requestPayload.format.properties.gaps);
 
   const summary = await llm.summarizeCommit({
-    endpoint: `http://127.0.0.1:${mock.address().port}`, model: 'test-model', timeoutMs: 5000,
+    endpoint: `http://127.0.0.1:${mock.address().port}`, provider: 'ollama', model: 'test-model', timeoutMs: 5000,
   }, {
     files: ['lib/example.js'], branch: 'feature/summary', truncated: false,
     patch: 'diff --git a/lib/example.js b/lib/example.js\n+const enabled = true;',
@@ -271,7 +273,7 @@ test('the assistant answers with tools and can only ever propose', async (t) => 
     plan: null,
   };
   const out = await assistant.chat(
-    { endpoint: `http://127.0.0.1:${mock.address().port}`, model: 'test-model', timeoutMs: 5000 },
+    { endpoint: `http://127.0.0.1:${mock.address().port}`, provider: 'ollama', model: 'test-model', timeoutMs: 5000 },
     { messages: [{ role: 'user', content: 'What is open?' }], ctx });
 
   assert.match(out.reply, /One open issue/);
@@ -696,7 +698,7 @@ test('plan prompts spend their budget on open issues, not finished ones', async 
   }
 
   await llm.planInsights({
-    endpoint: `http://127.0.0.1:${mock.address().port}`, model: 'test-model',
+    endpoint: `http://127.0.0.1:${mock.address().port}`, provider: 'ollama', model: 'test-model',
     timeoutMs: 5000, numCtx: 16384,
   }, {
     issues, milestones: [{ title: 'Release', dueOn: null, description: 'Ship it.' }],
@@ -946,4 +948,1141 @@ test('server protects its boot token and API on loopback', { timeout: 15000 }, a
   const saved = JSON.parse(fs.readFileSync(path.join(tempHome, '.config', 'vibe-git', 'config.json'), 'utf8'));
   assert.equal(saved.manifest.includes(ROOT), false);
   assert.equal(saved.removedRepos.includes(ROOT), true);
+});
+
+/* ── staged queue ─────────────────────────────────────────────────
+ *
+ * The queue went untested because constructing one wrote to the real config directory, where
+ * a test run could destroy staged-but-unpushed work. Queue now takes its file, so these
+ * exercise the actual class rather than KINDS in isolation.
+ */
+
+const { Queue } = require('../lib/queue');
+const ex = require('../lib/exec');
+
+function tempQueue(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vg-queue-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'queues.json');
+  return { file, dir, make: () => new Queue(file) };
+}
+
+const CTX = {
+  milestones: [{ title: 'Release' }, { title: 'Backlog' }],
+  labels: [{ name: 'bug' }, { name: 'enhancement' }],
+  issues: [{ n: 7, t: 'Broken thing', l: ['bug'] }, { n: 8, t: 'Other thing', l: [] }],
+};
+
+test('staged issue edits generate the exact gh argv', (t) => {
+  const q = tempQueue(t).make();
+  const repo = '/tmp/repo';
+
+  const edit = q.add(repo, 'edit', {
+    number: 7, title: 'Broken thing, precisely',
+    milestone: 'Release', addLabels: ['enhancement'], removeLabels: ['bug'],
+    addAssignees: ['octocat'],
+  }, CTX);
+  assert.deepEqual(edit.argv, [
+    'issue', 'edit', '7',
+    '--title', 'Broken thing, precisely',
+    '--milestone', 'Release',
+    '--add-label', 'enhancement',
+    '--remove-label', 'bug',
+    '--add-assignee', 'octocat',
+  ]);
+  assert.match(edit.summary, /^Edit #7: retitle · milestone → Release/);
+
+  // Clearing a milestone is a different flag from setting one, and an empty body is a real
+  // edit rather than an omitted field — both are places an "if (value)" test would pass and
+  // the feature would be broken.
+  const cleared = q.add(repo, 'edit', { number: 8, milestone: '', body: '' }, CTX);
+  assert.deepEqual(cleared.argv, ['issue', 'edit', '8', '--body', '', '--remove-milestone']);
+
+  assert.throws(() => q.add(repo, 'edit', { number: 7, milestone: 'Nope' }, CTX), /No milestone named/);
+  assert.throws(() => q.add(repo, 'edit', { number: 7, addLabels: ['nope'] }, CTX), /No label named/);
+  assert.throws(() => q.add(repo, 'edit', { number: 7, addAssignees: ['not a login!'] }, CTX), /not a valid GitHub login/);
+  assert.throws(() => q.add(repo, 'edit', { number: 7 }, CTX), /does not change anything/);
+  // Staging the identical edit twice is a double-click, not two intentions.
+  assert.throws(() => q.add(repo, 'edit', { number: 8, milestone: '', body: '' }, CTX), /already staged/);
+});
+
+test('a queued change can be reordered, edited, removed and cleared', (t) => {
+  const q = tempQueue(t).make();
+  const repo = '/tmp/repo';
+  const a = q.add(repo, 'comment', { number: 7, body: 'first' }, CTX);
+  const b = q.add(repo, 'comment', { number: 7, body: 'second' }, CTX);
+  const c = q.add(repo, 'comment', { number: 7, body: 'third' }, CTX);
+  const ids = () => q.for(repo).map(x => x.id);
+  assert.deepEqual(ids(), [a.id, b.id, c.id]);
+
+  assert.deepEqual(q.move(repo, c.id, -1).map(x => x.id), [a.id, c.id, b.id]);
+  assert.deepEqual(q.move(repo, a.id, +2).map(x => x.id), [c.id, b.id, a.id]);
+  // Past the ends is a clamp, not an error — a repeated key press should stop, not throw.
+  assert.deepEqual(q.move(repo, c.id, -5).map(x => x.id), [c.id, b.id, a.id]);
+  assert.deepEqual(q.move(repo, a.id, +9).map(x => x.id), [c.id, b.id, a.id]);
+  assert.throws(() => q.move(repo, 'nope', 1), /No staged change with that id/);
+
+  // An update re-validates and rebuilds argv, and keeps its position.
+  const edited = q.update(repo, b.id, { body: 'second, revised' }, CTX);
+  assert.deepEqual(edited.argv, ['issue', 'comment', '7', '--body', 'second, revised']);
+  assert.deepEqual(ids(), [c.id, b.id, a.id]);
+  assert.throws(() => q.update(repo, b.id, { body: 'third' }, CTX), /would duplicate/);
+
+  assert.deepEqual(q.remove(repo, b.id).map(x => x.id), [c.id, a.id]);
+  assert.throws(() => q.remove(repo, b.id), /No staged change with that id/);
+
+  // Clearing is per repository, not global.
+  q.add('/tmp/other', 'comment', { number: 7, body: 'elsewhere' }, CTX);
+  assert.deepEqual(q.clear(repo), []);
+  assert.equal(q.for('/tmp/other').length, 1);
+});
+
+test('staged changes survive a restart', (t) => {
+  const { file, make } = tempQueue(t);
+  const repo = '/tmp/repo';
+  const first = make();
+  first.add(repo, 'close', { number: 7, reason: 'not planned', comment: 'superseded' }, CTX);
+  first.add(repo, 'milestone', { title: 'Later', description: 'Things after the release.' }, CTX);
+
+  // A brand-new Queue over the same file is exactly what a server restart produces.
+  const second = make();
+  const list = second.for(repo);
+  assert.equal(list.length, 2);
+  assert.deepEqual(list[0].argv, ['issue', 'close', '7', '--reason', 'not planned', '--comment', 'superseded']);
+  assert.equal(list[1].payload.title, 'Later');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8'))[repo].length, 2);
+
+  // And the reconstructed queue is fully usable, not just readable.
+  assert.deepEqual(second.remove(repo, list[0].id).map(c => c.kind), ['milestone']);
+  assert.equal(make().for(repo).length, 1);
+});
+
+test('pushing applies in order, hoists prerequisites, and stops at the first failure', async (t) => {
+  const { make, dir } = tempQueue(t);
+  // A real directory, because push spawns gh with it as cwd — the dry-run path never does,
+  // which is exactly the difference this test exists to cover.
+  const repo = dir;
+  const q = make();
+
+  // Staged out of order on purpose: the label is a prerequisite for the edit that applies it.
+  q.add(repo, 'comment', { number: 7, body: 'first' }, CTX);
+  q.add(repo, 'label', { name: 'flaky', description: 'Intermittent' }, CTX);
+  q.add(repo, 'comment', { number: 8, body: 'second' }, CTX);
+
+  ex.setDryRun(true);
+  t.after(() => ex.setDryRun(false));
+  const ok = await q.push(repo, dir);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.applied, 3);
+  assert.equal(ok.remaining, 0);
+  assert.equal(q.for(repo).length, 0);
+  // Label first regardless of staging order, because the changes that reference it come after.
+  assert.deepEqual(ok.results.map(r => r.summary.slice(0, 14)),
+    ['Create label “', 'Comment on #7 ', 'Comment on #8 ']);
+
+  /*
+   * Failure handling, against a real subprocess rather than a stub: a `gh` on PATH that
+   * refuses issue #8. What matters is that the run STOPS — everything after the failure must
+   * stay staged, because a queue that silently carried on would leave the user reconciling a
+   * half-applied set against GitHub by hand.
+   */
+  ex.setDryRun(false);
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'vg-bin-'));
+  t.after(() => fs.rmSync(bin, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(bin, 'gh'),
+    '#!/bin/sh\nfor a in "$@"; do [ "$a" = "8" ] && { echo "refused" >&2; exit 1; }; done\necho https://github.com/o/r/issues/1\n',
+    { mode: 0o755 });
+  const realPath = process.env.PATH;
+  process.env.PATH = bin + path.delimiter + realPath;
+  t.after(() => { process.env.PATH = realPath; });
+
+  const a = q.add(repo, 'comment', { number: 7, body: 'fine' }, CTX);
+  q.add(repo, 'comment', { number: 8, body: 'doomed' }, CTX);
+  const c = q.add(repo, 'comment', { number: 7, body: 'never reached' }, CTX);
+  const bad = await q.push(repo, dir);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.applied, 1);
+  assert.match(bad.message, /^Applied 1, then stopped: /);
+  assert.equal(bad.results[0].url, 'https://github.com/o/r/issues/1');
+  // The successful one is gone; the failure and everything behind it are still staged.
+  assert.deepEqual(q.for(repo).map(x => x.payload.body), ['doomed', 'never reached']);
+  assert.equal(q.for(repo).some(x => x.id === a.id), false);
+  assert.equal(q.for(repo).some(x => x.id === c.id), true);
+});
+
+/* ── model providers ──────────────────────────────────────────────
+ *
+ * The wire, not the prompting. What matters per dialect is: the route it posts to, how it is
+ * told to produce JSON, how a tool call is spelled in both directions, and that a key never
+ * comes back out towards the browser.
+ */
+
+const providers = require('../lib/providers');
+const workspace = require('../lib/workspace');
+
+function mockEndpoint(t, handler) {
+  const seen = [];
+  const mock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      const entry = {
+        method: req.method, url: req.url, headers: req.headers,
+        body: raw ? JSON.parse(raw) : null,
+      };
+      seen.push(entry);
+      const reply = handler(entry, res);
+      if (res.writableEnded) return;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(reply == null ? {} : reply));
+    });
+  });
+  return { seen, mock };
+}
+
+async function listen(t, mock) {
+  try {
+    await new Promise((resolve, reject) => { mock.once('error', reject); mock.listen(0, '127.0.0.1', resolve); });
+  } catch (error) {
+    if (error && error.code === 'EPERM') return null;
+    throw error;
+  }
+  t.after(() => new Promise(resolve => mock.close(resolve)));
+  return `http://127.0.0.1:${mock.address().port}`;
+}
+
+test('an OpenAI-compatible endpoint gets /v1 routes, a bearer token and a JSON schema', async (t) => {
+  const { seen, mock } = mockEndpoint(t, (req) => {
+    if (req.url.endsWith('/v1/models')) return { data: [{ id: 'qwen3', owned_by: 'local' }] };
+    if (req.url.endsWith('/v1/embeddings')) {
+      // Deliberately out of order: `index` is authoritative, not arrival order.
+      return { data: [{ index: 1, embedding: [0, 1] }, { index: 0, embedding: [1, 0] }] };
+    }
+    return { choices: [{ message: { content: '{"subject":"Tidy the parser","body":"Because."}' } }] };
+  });
+  const endpoint = await listen(t, mock);
+  if (!endpoint) { t.skip('this environment does not permit loopback listeners'); return; }
+
+  const cfg = { endpoint, provider: 'openai', apiKey: 'sk-test-123', model: 'qwen3', embedModel: 'nomic', timeoutMs: 5000 };
+
+  const status = await llm.status(cfg);
+  assert.equal(status.ok, true);
+  assert.equal(status.provider, 'openai');
+  assert.deepEqual(status.models.map(m => m.name), ['qwen3']);
+  assert.equal(status.can.unload, false);          // nothing to evict on a hosted endpoint
+
+  const summary = await llm.summarizeCommit(cfg, {
+    files: ['lib/x.js'], branch: 'main', truncated: false, patch: 'diff --git a/x b/x\n+1',
+  });
+  assert.equal(summary.subject, 'Tidy the parser');
+
+  const chatCall = seen.find(r => r.url.endsWith('/v1/chat/completions'));
+  assert.equal(chatCall.headers.authorization, 'Bearer sk-test-123');
+  assert.equal(chatCall.body.response_format.type, 'json_schema');
+  assert.ok(chatCall.body.response_format.json_schema.schema.properties.subject);
+  assert.equal(chatCall.body.stream, false);
+
+  const vecs = await llm.embed(cfg, ['a', 'b']);
+  assert.deepEqual(vecs, [[1, 0], [0, 1]]);
+});
+
+test('an OpenAI-compatible server that rejects response_format still answers', async (t) => {
+  let attempt = 0;
+  const { seen, mock } = mockEndpoint(t, (req, res) => {
+    if (req.url.endsWith('/v1/models')) return { data: [{ id: 'tiny' }] };
+    attempt++;
+    // llama.cpp builds without grammar support answer exactly like this.
+    if (attempt === 1) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'response_format json_schema is not supported' } }));
+      return null;
+    }
+    // Small models fence their JSON; the parser has to cope rather than call it malformed.
+    return { choices: [{ message: { content: '```json\n{"subject":"Fix it","body":""}\n```' } }] };
+  });
+  const endpoint = await listen(t, mock);
+  if (!endpoint) { t.skip('this environment does not permit loopback listeners'); return; }
+
+  const summary = await llm.summarizeCommit(
+    { endpoint, provider: 'openai', model: 'tiny', timeoutMs: 5000 },
+    { files: ['a.js'], branch: 'main', truncated: false, patch: 'diff' });
+  assert.equal(summary.subject, 'Fix it');
+  assert.equal(attempt, 2);
+  // The fallback carries the schema in a system message so the model still knows the shape.
+  const second = seen.filter(r => r.url.endsWith('/v1/chat/completions'))[1];
+  assert.equal(second.body.response_format.type, 'json_object');
+  assert.match(second.body.messages[0].content, /JSON Schema/);
+});
+
+test('Anthropic gets its own headers, a system field, and a forced tool for JSON', async (t) => {
+  const { seen, mock } = mockEndpoint(t, (req) => {
+    if (req.url.endsWith('/v1/models')) return { data: [{ id: 'claude-x', display_name: 'Claude X' }] };
+    return {
+      content: [{ type: 'tool_use', id: 'tu_1', name: 'emit_result', input: { subject: 'Rework it', body: 'Why.' } }],
+    };
+  });
+  const endpoint = await listen(t, mock);
+  if (!endpoint) { t.skip('this environment does not permit loopback listeners'); return; }
+
+  const cfg = { endpoint, provider: 'anthropic', apiKey: 'sk-ant-xyz', model: 'claude-x', timeoutMs: 5000 };
+  const status = await llm.status(cfg);
+  assert.equal(status.provider, 'anthropic');
+  assert.equal(status.can.embed, false);
+
+  const summary = await llm.summarizeCommit(cfg, {
+    files: ['a.js'], branch: 'main', truncated: false, patch: 'diff',
+  });
+  assert.equal(summary.subject, 'Rework it');
+
+  const call = seen.find(r => r.url.endsWith('/v1/messages'));
+  assert.equal(call.headers['x-api-key'], 'sk-ant-xyz');
+  assert.equal(call.headers['anthropic-version'], '2023-06-01');
+  assert.ok(call.body.system.includes('commit message'));       // system is a field, not a message
+  assert.equal(call.body.messages.every(m => m.role !== 'system'), true);
+  assert.equal(call.body.tool_choice.name, 'emit_result');
+  assert.ok(call.body.tools[0].input_schema.properties.subject);
+  assert.ok(call.body.max_tokens > 0);
+
+  // Anthropic has no embeddings, and the error has to say what to do instead.
+  await assert.rejects(() => llm.embed(Object.assign({}, cfg, { embedModel: 'nope' }), ['x']),
+    /no embedding API/);
+});
+
+test('a tool conversation is translated into each dialect and back', () => {
+  const canonical = [
+    { role: 'system', content: 'rules' },
+    { role: 'user', content: 'what is open?' },
+    { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_issues', arguments: { state: 'open' } } }] },
+    { role: 'tool', name: 'list_issues', content: '{"matched":1}' },
+  ];
+  const tagged = providers.withCallIds(canonical);
+  const call = tagged.find(m => m.calls);
+  const result = tagged.find(m => m.role === 'tool');
+  // The result must point at the call it answers, or the hosted APIs reject the turn outright.
+  assert.equal(result.id, call.calls[0].id);
+  assert.equal(call.calls[0].name, 'list_issues');
+
+  // An orphan result (history the browser trimmed mid-conversation) still gets an id rather
+  // than colliding with a real one.
+  const orphan = providers.withCallIds([{ role: 'tool', name: 'x', content: '{}' }]);
+  assert.match(orphan[0].id, /^call_orphan_/);
+});
+
+test('an API key is never sent back towards the browser', () => {
+  const shown = providers.redact({
+    endpoint: 'https://api.openai.com', apiKey: 'sk-live-secret-value', embedApiKey: '${OPENAI_KEY}', model: 'gpt',
+  });
+  assert.equal(shown.apiKey, '••••••••');
+  assert.doesNotMatch(JSON.stringify(shown), /secret/);
+  // The ${VAR} form is not a secret, and hiding it would make "is a key configured?" unanswerable.
+  assert.equal(shown.embedApiKey, '${OPENAI_KEY}');
+  assert.equal(providers.redact({ apiKey: null }).apiKey, null);
+
+  process.env.VG_TEST_KEY = 'from-the-environment';
+  assert.equal(providers.resolveKey('${VG_TEST_KEY}'), 'from-the-environment');
+  assert.equal(providers.resolveKey('plain'), 'plain');
+  assert.throws(() => providers.resolveKey('${VG_TEST_MISSING}'), /is not set in this environment/);
+  delete process.env.VG_TEST_KEY;
+});
+
+test('endpoint paths survive being pasted with or without /v1', () => {
+  const u = (base, route, versioned) => providers.apiUrl(base, route, { versioned }).href;
+  assert.equal(u('https://api.openai.com', 'chat/completions', true), 'https://api.openai.com/v1/chat/completions');
+  assert.equal(u('https://api.openai.com/v1', 'chat/completions', true), 'https://api.openai.com/v1/chat/completions');
+  assert.equal(u('https://api.openai.com/v1/', 'chat/completions', true), 'https://api.openai.com/v1/chat/completions');
+  // A reverse proxy prefix has to be kept, not swallowed.
+  assert.equal(u('https://box.example/llm', 'models', true), 'https://box.example/llm/v1/models');
+  assert.equal(u('http://127.0.0.1:11434', 'api/chat', false), 'http://127.0.0.1:11434/api/chat');
+  assert.throws(() => providers.apiUrl('not a url', 'x'), /Bad AI endpoint/);
+});
+
+/* ── conflicts, recovery, and reading the working tree ───────────── */
+
+function scratchRepo(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vg-git-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const run = (...args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe' });
+  run('init', '-q', '-b', 'main');
+  run('config', 'user.email', 't@example.com');
+  run('config', 'user.name', 'Test');
+  return { dir, run };
+}
+
+test('a conflicted merge reports its count instead of throwing, and can be aborted', async (t) => {
+  const { dir, run } = scratchRepo(t);
+  fs.writeFileSync(path.join(dir, 'f.txt'), 'base\n');
+  run('add', '.'); run('commit', '-qm', 'base');
+  run('switch', '-qc', 'other');
+  fs.writeFileSync(path.join(dir, 'f.txt'), 'theirs\n');
+  run('commit', '-qam', 'theirs');
+  run('switch', '-q', 'main');
+  fs.writeFileSync(path.join(dir, 'f.txt'), 'ours\n');
+  run('commit', '-qam', 'ours');
+
+  /*
+   * git exits 1 on a conflicted merge, and lib/exec rejects on any nonzero exit — which used
+   * to make the "merged with N conflicts" message unreachable dead code. The user saw a raw
+   * red toast with no count and no next step.
+   */
+  const merged = await gitOps.merge(dir, 'other');
+  assert.equal(merged.ok, true);
+  assert.equal(merged.conflicted, 1);
+  assert.match(merged.message, /1 conflict/);
+  assert.equal(merged.recovery.action, 'merge-abort');
+
+  assert.deepEqual(await gitOps.mergeState(dir), { inProgress: true, kind: 'merge' });
+  assert.equal((await gitOps.status(dir)).conflicted, 1);
+  assert.equal((await gitOps.fileDiff(dir, 'f.txt')).conflicted, true);
+
+  const aborted = await gitOps.abortMerge(dir);
+  assert.match(aborted.message, /back as it was/);
+  assert.deepEqual(await gitOps.mergeState(dir), { inProgress: false, kind: null });
+  assert.equal(fs.readFileSync(path.join(dir, 'f.txt'), 'utf8'), 'ours\n');
+  await assert.rejects(() => gitOps.abortMerge(dir), /No merge is in progress/);
+});
+
+test('a pull that cannot fast-forward carries the way out of itself', async (t) => {
+  const { dir, run } = scratchRepo(t);
+  fs.writeFileSync(path.join(dir, 'f.txt'), 'one\n');
+  run('add', '.'); run('commit', '-qm', 'one');
+
+  // No upstream yet: that is a different problem and must not offer the stash dance.
+  await assert.rejects(() => gitOps.sync(dir, 'pull'), (e) => {
+    assert.match(e.message, /no upstream/i);
+    assert.equal(e.recovery, undefined);
+    return true;
+  });
+
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'vg-remote-'));
+  t.after(() => fs.rmSync(remote, { recursive: true, force: true }));
+  execFileSync('git', ['init', '-q', '--bare', remote], { stdio: 'pipe' });
+  run('remote', 'add', 'origin', remote);
+  run('push', '-q', '--set-upstream', 'origin', 'main');
+
+  // Now dirty the tree. The old message said "commit or discard", which is advice that
+  // ignores why the changes are uncommitted in the first place.
+  fs.writeFileSync(path.join(dir, 'f.txt'), 'edited\n');
+  await assert.rejects(() => gitOps.sync(dir, 'pull'), (e) => {
+    assert.match(e.message, /would overwrite them/);
+    assert.equal(e.recovery.action, 'stash-pull-restore');
+    assert.equal(e.recovery.steps.length, 3);
+    return true;
+  });
+
+  // And the recovery really is those three commands, in order, leaving the edit in place.
+  const recovered = await gitOps.recover(dir, 'stash-pull-restore');
+  assert.equal(recovered.ok, true);
+  assert.deepEqual(recovered.steps, ['stashed your changes', 'pulled', 'restored your changes']);
+  assert.equal(fs.readFileSync(path.join(dir, 'f.txt'), 'utf8'), 'edited\n');
+  assert.equal((await gitOps.stash(dir, 'list')).stashes.length, 0);
+  await assert.rejects(() => gitOps.recover(dir, 'rm -rf'), /Unknown recovery action/);
+});
+
+/* ── conflict resolution ─────────────────────────────────────────── */
+
+/* main and `other` both change the same two regions, three lines apart, so git leaves two
+   separate conflicts in one file — which is the case that matters for partial resolution. */
+function conflictedRepo(t) {
+  const { dir, run } = scratchRepo(t);
+  const write = (name, s) => fs.writeFileSync(path.join(dir, name), s);
+  write('shared.txt', 'alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n');
+  write('doomed.txt', 'x\n');
+  run('add', '.'); run('commit', '-qm', 'base');
+  run('switch', '-qc', 'other');
+  write('shared.txt', 'alpha\nB-other\ngamma\ndelta\nepsilon\nzeta\nE-other\ntheta\n');
+  run('rm', '-q', 'doomed.txt');
+  // Explicit, distinct dates: "which side is newer" is a claim the view makes, and a fixture
+  // whose commits land in the same second cannot tell a correct answer from a coin toss.
+  run('commit', '-qam', 'other changes both regions and deletes a file', '--date=2026-01-01T10:00:00');
+  run('switch', '-q', 'main');
+  write('shared.txt', 'alpha\nB-main\ngamma\ndelta\nepsilon\nzeta\nE-main\ntheta\n');
+  write('doomed.txt', 'x\ny\n');
+  run('commit', '-qam', 'main changes both regions and edits that file', '--date=2026-02-01T10:00:00');
+  return { dir, run, read: (n) => fs.readFileSync(path.join(dir, n), 'utf8') };
+}
+
+test('a conflict names its sides by branch, not by "ours" and "theirs"', async (t) => {
+  const { dir } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+
+  const st = await conflicts.state(dir);
+  assert.equal(st.operation.kind, 'merge');
+  assert.equal(st.operation.swapped, false);
+  assert.equal(st.operation.ours.name, 'main');
+  assert.equal(st.operation.theirs.name, 'other');
+  assert.equal(st.operation.ours.role, 'The branch you are on');
+  assert.equal(st.operation.theirs.role, 'The branch being merged in');
+  // Which side is newer is decided once, on the server, rather than by comparing two ISO
+  // strings in a template that then has to be right in four places.
+  assert.equal(st.operation.ours.age, 'newer');
+  assert.equal(st.operation.theirs.age, 'older');
+  assert.match(st.operation.direction, /<<<<<<<\) is main/);
+
+  // Every button says which branch it is about.
+  const shared = st.files.find(f => f.path === 'shared.txt');
+  assert.deepEqual(shared.options.map(o => o.label), ['Use all of main', 'Use all of other']);
+  assert.equal(shared.kind, 'both-modified');
+  assert.equal(shared.hunks, 2);
+
+  /* A modify/delete conflict has NOTHING between markers to choose between, so it gets
+     options about the file's existence instead of two versions of its contents. */
+  const doomed = st.files.find(f => f.path === 'doomed.txt');
+  assert.equal(doomed.kind, 'deleted-by-them');
+  assert.equal(doomed.expectMarkers, false);
+  assert.deepEqual(doomed.options.map(o => o.id), ['keep', 'delete']);
+});
+
+test('a rebase says out loud that its sides are reversed', async (t) => {
+  const { dir, run } = scratchRepo(t);
+  fs.writeFileSync(path.join(dir, 'cfg.txt'), 'base\n');
+  run('add', '.'); run('commit', '-qm', 'base');
+  run('switch', '-qc', 'mine');
+  fs.writeFileSync(path.join(dir, 'cfg.txt'), 'MY WORK\n');
+  run('commit', '-qam', 'my commit');
+  run('switch', '-q', 'main');
+  fs.writeFileSync(path.join(dir, 'cfg.txt'), 'upstream\n');
+  run('commit', '-qam', 'upstream commit');
+  run('switch', '-q', 'mine');
+  try { run('rebase', 'main'); } catch { /* conflicting is the point */ }
+
+  const { operation: op } = await conflicts.state(dir);
+  assert.equal(op.kind, 'rebase');
+  assert.equal(op.swapped, true);
+  /*
+   * The whole reason this module exists. Git writes `<<<<<<< HEAD` for the UPSTREAM during a
+   * rebase, so anyone who reads "HEAD" as "my work" resolves it exactly backwards — and the
+   * marker text is no help, because it says HEAD either way.
+   */
+  assert.equal(op.ours.name, 'main');
+  assert.match(op.ours.role, /replaying onto/);
+  assert.match(op.theirs.role, /your own commit/i);
+  assert.match(op.direction, /reverses the usual sides/);
+
+  const detail = await conflicts.file(dir, 'cfg.txt');
+  assert.deepEqual(detail.hunks[0].ours, ['upstream']);
+  assert.deepEqual(detail.hunks[0].theirs, ['MY WORK']);
+});
+
+test('resolving one conflict leaves the others in the file untouched', async (t) => {
+  const { dir, read } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+
+  const before = await conflicts.file(dir, 'shared.txt');
+  assert.equal(before.hunkCount, 2);
+
+  const r = await conflicts.resolveHunks(dir, 'shared.txt',
+    [{ index: before.hunks[0].index, choice: 'ours' }], { expect: before.fingerprint });
+  assert.equal(r.remaining, 1);
+
+  /*
+   * The regression this guards. Serializing only the resolved regions writes a file with the
+   * other conflicts SILENTLY DELETED — markers, both sides and all — and the loss looks
+   * exactly like a successful resolution until someone reads the file.
+   */
+  const text = read('shared.txt');
+  assert.match(text, /^B-main$/m);
+  assert.match(text, /^<{7} HEAD$/m);
+  assert.match(text, /^E-main$/m);
+  assert.match(text, /^E-other$/m);
+  assert.equal(text.split('\n').filter(l => l === '=======').length, 1);
+
+  const after = await conflicts.file(dir, 'shared.txt');
+  assert.equal(after.hunkCount, 1);
+  assert.equal(after.ready, false);
+
+  // Every per-hunk option, applied to what is left.
+  const both = await conflicts.resolveHunks(dir, 'shared.txt',
+    [{ index: after.hunks[0].index, choice: 'both' }], { expect: after.fingerprint });
+  assert.equal(both.remaining, 0);
+  assert.match(read('shared.txt'), /E-main\nE-other/);
+  assert.equal((await conflicts.file(dir, 'shared.txt')).ready, true);
+});
+
+test('a stale fingerprint is refused rather than merged over', async (t) => {
+  const { dir } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+  const d = await conflicts.file(dir, 'shared.txt');
+  // Someone edited the file in a real editor while this screen sat there. Writing the
+  // decision anyway would revert their edit and call it a resolution.
+  fs.appendFileSync(path.join(dir, 'shared.txt'), 'a line added elsewhere\n');
+  await assert.rejects(
+    () => conflicts.resolveHunks(dir, 'shared.txt',
+      [{ index: d.hunks[0].index, choice: 'ours' }], { expect: d.fingerprint }),
+    /changed since/);
+});
+
+test('nothing is staged until you say so, so a resolution can be taken back', async (t) => {
+  const { dir, read } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+  const d = await conflicts.file(dir, 'shared.txt');
+  await conflicts.resolveHunks(dir, 'shared.txt',
+    d.hunks.map(hunk => ({ index: hunk.index, choice: 'ours' })), { expect: d.fingerprint });
+  assert.equal(read('shared.txt').includes('B-other'), false);
+
+  /*
+   * `git add` on a conflicted path destroys the recorded stages, and with them any way back.
+   * Because resolution stops short of staging, the stages survive and the markers can be
+   * regenerated — including with the common ancestor, which is the one view that shows what
+   * each side actually CHANGED rather than only what each ended up with.
+   */
+  await conflicts.reopen(dir, 'shared.txt', { withAncestor: true });
+  const again = await conflicts.file(dir, 'shared.txt');
+  assert.equal(again.hunkCount, 2);
+  assert.deepEqual(again.hunks[0].base, ['beta']);
+  assert.deepEqual(again.hunks[0].ours, ['B-main']);
+  assert.deepEqual(again.hunks[0].theirs, ['B-other']);
+
+  const reverted = await conflicts.resolveHunks(dir, 'shared.txt',
+    [{ index: again.hunks[0].index, choice: 'base' }], { expect: again.fingerprint });
+  assert.equal(reverted.remaining, 1);
+  assert.match(read('shared.txt'), /^beta$/m);
+});
+
+test('continuing refuses while anything is undecided, then stages and commits', async (t) => {
+  const { dir, read } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+
+  await assert.rejects(() => conflicts.proceed(dir), /still unresolved/);
+
+  const d = await conflicts.file(dir, 'shared.txt');
+  await conflicts.resolveHunks(dir, 'shared.txt',
+    d.hunks.map(hunk => ({ index: hunk.index, choice: 'theirs' })), { expect: d.fingerprint });
+
+  /*
+   * doomed.txt has no markers, so judging readiness by markers alone calls it finished and
+   * lets Continue commit one side of a deletion nobody chose. Its kind is the authority, not
+   * its contents.
+   */
+  let st = await conflicts.state(dir);
+  assert.equal(st.files.find(f => f.path === 'shared.txt').ready, true);
+  assert.equal(st.files.find(f => f.path === 'doomed.txt').ready, false);
+  assert.equal(st.canContinue, false);
+  await assert.rejects(() => conflicts.proceed(dir), /doomed\.txt/);
+  await assert.rejects(() => conflicts.markResolved(dir, ['doomed.txt']), /whole-file options/);
+
+  await conflicts.resolveFile(dir, 'doomed.txt', 'delete');
+  st = await conflicts.state(dir);
+  assert.equal(st.canContinue, true);
+  assert.equal(st.remaining, 0);
+
+  const done = await conflicts.proceed(dir);
+  assert.equal(done.done, true);
+  assert.equal((await gitOps.mergeState(dir)).inProgress, false);
+  assert.equal((await gitOps.status(dir)).clean, true);
+  assert.match(read('shared.txt'), /^B-other$/m);
+  assert.equal(fs.existsSync(path.join(dir, 'doomed.txt')), false);
+});
+
+test('a conflict cannot be used to write outside the repository', async (t) => {
+  const { dir } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+  // The membership test against live `git status` is the boundary; a path git did not just
+  // report as unmerged is not writable, whatever it looks like.
+  for (const p of ['../escape.txt', '/etc/passwd', '--force', 'shared.txt ', '']) {
+    await assert.rejects(() => conflicts.file(dir, p));
+    await assert.rejects(() => conflicts.resolveFile(dir, p, 'ours'));
+  }
+  await assert.rejects(
+    () => conflicts.resolveHunks(dir, 'shared.txt', [{ index: 1, choice: 'constructor' }]),
+    /Unknown resolution choice/);
+  await assert.rejects(() => conflicts.resolveFile(dir, 'shared.txt', 'delete'),
+    /does not apply/);
+});
+
+test('dry-run never touches the working tree or the index', async (t) => {
+  const { dir, read } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+  const before = read('shared.txt');
+  const d = await conflicts.file(dir, 'shared.txt');
+
+  ex.setDryRun(true);
+  try {
+    /*
+     * Resolving writes the file with fs, not with git — so it cannot ride on gitWrite's
+     * dry-run interception and has to check for itself. Missing that would make --dry-run
+     * silently destructive, which is worse than not offering it.
+     */
+    assert.match((await conflicts.resolveHunks(dir, 'shared.txt',
+      [{ index: d.hunks[0].index, choice: 'ours' }], { expect: d.fingerprint })).message, /^Would/);
+    assert.match((await conflicts.resolveFile(dir, 'shared.txt', 'theirs')).message, /^Would/);
+    assert.match((await conflicts.resolveText(dir, 'shared.txt', 'replaced\n',
+      { expect: d.fingerprint })).message, /^Would/);
+    // Guard rails still apply under dry-run: a refusal must not depend on whether writes are
+    // real, or dry-run would rehearse a path the live run rejects.
+    await assert.rejects(() => conflicts.markResolved(dir, ['shared.txt']), /still has conflict markers/);
+    await assert.rejects(() => conflicts.proceed(dir), /still unresolved/);
+  } finally { ex.setDryRun(false); }
+
+  assert.equal(read('shared.txt'), before);
+  assert.equal((await gitOps.status(dir)).conflicted, 2);
+});
+
+test('the assistant is handed positional sides, never "ours" and "theirs"', async (t) => {
+  const { dir } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+  const ctx = await conflicts.aiContext(dir, 'shared.txt', null);
+  assert.equal(ctx.hunks.length, 2);
+  assert.equal(ctx.operation.ours.name, 'main');
+
+  let sent = null;
+  const fake = {
+    model: 'm',
+    async chat(_cfg, messages) {
+      sent = messages.map(m => m.content).join('\n');
+      return {
+        content: JSON.stringify({
+          hunks: [
+            { index: ctx.hunks[0].index, choice: 'first', why: 'main is right', confidence: 0.8 },
+            { index: ctx.hunks[1].index, choice: 'unsure', why: 'genuinely ambiguous', confidence: 0.2 },
+            { index: 999, choice: 'second', why: 'not a real conflict', confidence: 0.9 },
+            { index: ctx.hunks[0].index, choice: 'custom', text: '   ', why: 'empty', confidence: 0.9 },
+          ],
+        }),
+      };
+    },
+  };
+  const restore = llm.providers.resolve;
+  llm.providers.resolve = async () => fake;
+  try {
+    const out = await llm.resolveConflict({ model: 'm' }, ctx);
+    // Positional in, positional out, mapped back to sides only on this side of the wire.
+    assert.match(sent, /FIRST VERSION \(from main\)/);
+    assert.match(sent, /SECOND VERSION \(from other\)/);
+    assert.equal(/\bours\b|\btheirs\b/i.test(sent), false);
+    assert.equal(out.hunks[0].choice, 'ours');
+    assert.equal(out.hunks[1].choice, 'unsure');
+    // A hunk the model invented, and a "custom" with no text, are both dropped.
+    assert.equal(out.hunks.length, 2);
+  } finally { llm.providers.resolve = restore; }
+});
+
+/* ── image previews ──────────────────────────────────────────────── */
+
+/* Minimal but genuinely valid headers. Real files would work too, but a checked-in binary
+   fixture is a thing nobody can read in a diff or verify by eye in review. */
+function pngBytes(w, h) {
+  const buf = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).copy(buf, 0);
+  buf.writeUInt32BE(13, 8);
+  buf.write('IHDR', 12, 'latin1');
+  buf.writeUInt32BE(w, 16);
+  buf.writeUInt32BE(h, 20);
+  return buf;
+}
+
+test('image headers are read for size without decoding the image', () => {
+  const png = pngBytes(32, 48);
+  assert.equal(images.sniff(png), 'image/png');
+  assert.deepEqual(images.dimensions(png, 'image/png'), { width: 32, height: 48 });
+
+  const gif = Buffer.concat([Buffer.from('GIF89a', 'latin1'), Buffer.alloc(8)]);
+  gif.writeUInt16LE(64, 6); gif.writeUInt16LE(16, 8);
+  assert.equal(images.sniff(gif), 'image/gif');
+  assert.deepEqual(images.dimensions(gif, 'image/gif'), { width: 64, height: 16 });
+
+  // JPEG requires walking the segment chain: APP0 first, then the frame header.
+  const jpeg = Buffer.concat([
+    Buffer.from([0xFF, 0xD8]),
+    Buffer.from([0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00]),          // APP0, length 4
+    Buffer.from([0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0x2C, 0x00, 0xC8]), // SOF0 300x200
+  ]);
+  assert.equal(images.sniff(jpeg), 'image/jpeg');
+  assert.deepEqual(images.dimensions(jpeg, 'image/jpeg'), { width: 200, height: 300 });
+
+  // Only the raster allowlist is previewable. SVG is markup that can carry script, so it
+  // stays on the text-diff path rather than being rendered in this privileged origin.
+  assert.equal(images.isImage('Sprites/Tiles Sprites/Wood Floor.png'), true);
+  assert.equal(images.isImage('a/b.JPEG'), true);
+  assert.equal(images.isImage('icon.svg'), false);
+  assert.equal(images.isImage('notes.md'), false);
+  assert.equal(images.isImage(''), false);
+});
+
+test('binary blobs survive the read that text blobs go through', async (t) => {
+  const { dir, run } = scratchRepo(t);
+  /*
+   * The default exec path decodes stdout as UTF-8, which turns every byte sequence that is
+   * not valid UTF-8 into U+FFFD. A PNG read that way comes back corrupted while still looking
+   * like a successful read, so this asserts the bytes, not the absence of an error.
+   */
+  const png = Buffer.concat([pngBytes(8, 8), Buffer.from([0xFF, 0xFE, 0x00, 0x80, 0xC3, 0x28])]);
+  fs.writeFileSync(path.join(dir, 'tile.png'), png);
+  run('add', '.'); run('commit', '-qm', 'add a sprite');
+  fs.writeFileSync(path.join(dir, 'tile.png'), Buffer.concat([pngBytes(16, 16), Buffer.from([0x00, 0x81])]));
+
+  const head = await images.version(dir, 'tile.png', 'head');
+  assert.equal(head.bytes, png.length, 'byte count must survive the round trip');
+  assert.deepEqual({ w: head.width, h: head.height }, { w: 8, h: 8 });
+  assert.equal(Buffer.from(head.data.split(',')[1], 'base64').equals(png), true);
+
+  const now = await images.version(dir, 'tile.png', 'worktree');
+  assert.deepEqual({ w: now.width, h: now.height }, { w: 16, h: 16 });
+
+  // A version that does not exist is null, not an error: a file added on one side only
+  // genuinely has no "before", and the panel says so rather than showing a failure.
+  assert.equal(await images.version(dir, 'tile.png', 'base'), null);
+  await assert.rejects(() => images.version(dir, 'notes.txt', 'head'), /not a previewable image/);
+});
+
+/*
+ * Two branches reorganised the same sprite folder under different names, so git reports a
+ * conflict on files whose contents are byte-identical. Reproduced here because the resulting
+ * UI was actively misleading — it counted "0" conflicts on a row it would not let you dismiss,
+ * and offered a choice between two identical things without ever saying they were identical.
+ */
+function renamedDirRepo(t) {
+  const { dir, run } = scratchRepo(t);
+  const sprite = pngBytes(32, 32);
+  const fence = Buffer.concat([pngBytes(32, 32), Buffer.from([0x01, 0x02, 0x03])]);
+  const at = (p) => path.join(dir, p);
+  /*
+   * `Sprites/Tiles/` must exist in the BASE. That is what lets git's directory-rename
+   * detection fire and collapse the whole thing onto one path — which is what produces
+   * identical stages. Without it git reports plain rename/rename instead, three entries per
+   * file, and the case under test never occurs.
+   */
+  fs.mkdirSync(at('Sprites/Tiles'), { recursive: true });
+  fs.writeFileSync(at('Sprites/Tiles/Ground Tile Sheet.png'), pngBytes(128, 128));
+  fs.writeFileSync(at('Sprites/Wood Floor.png'), sprite);
+  run('add', '.'); run('commit', '-qm', 'base');
+
+  run('switch', '-qc', 'development');
+  fs.mkdirSync(at('Sprites/Tiles Sprites'), { recursive: true });
+  run('mv', 'Sprites/Tiles/Ground Tile Sheet.png', 'Sprites/Tiles Sprites/Ground Tile Sheet.png');
+  run('mv', 'Sprites/Wood Floor.png', 'Sprites/Tiles Sprites/Wood Floor.png');
+  fs.writeFileSync(at('Sprites/Tiles Sprites/Old_Fence_Tile.png'), fence);
+  run('add', '-A'); run('commit', '-qm', 'development: rename Tiles -> Tiles Sprites');
+
+  run('switch', '-q', 'main');
+  run('mv', 'Sprites/Wood Floor.png', 'Sprites/Tiles/Wood Floor.png');
+  fs.writeFileSync(at('Sprites/Tiles/Old_Fence_Tile.png'), fence);
+  run('add', '-A'); run('commit', '-qm', 'main: add into the existing Tiles folder');
+  return { dir, run, sprite, fence };
+}
+
+test('a conflict whose sides are byte-identical says so instead of offering a false choice', async (t) => {
+  const { dir } = renamedDirRepo(t);
+  try { execFileSync('git', ['merge', '--no-ff', 'development'], { cwd: dir, stdio: 'pipe' }); }
+  catch { /* conflicting is the point */ }
+
+  const st = await conflicts.state(dir);
+  assert.equal(st.files.length, 2);
+  for (const f of st.files) {
+    // Both sides hold the same blob: the dispute is about the PATH, not the contents.
+    assert.equal(f.identical, true, f.path + ' should be recognised as identical');
+    assert.equal(f.image, true);
+    assert.equal(f.binary, true);
+    assert.match(f.note.headline, /Identical on both sides/);
+    assert.match(f.note.detail, /file location/);
+    assert.match(f.note.detail, /nothing to lose/);
+    /*
+     * The bug this pins down: readiness and the marker count were derived from `expectMarkers`
+     * alone, so a binary conflict reported "0" conflicts — which reads as "nothing wrong" on
+     * a row that cannot be dismissed and blocks the merge.
+     */
+    assert.equal(f.hunks, 0);
+    assert.equal(f.ready, false, 'a binary conflict is never resolved by having no markers');
+  }
+  assert.equal(st.canContinue, false);
+
+  const floor = st.files.find(f => f.path.endsWith('Wood Floor.png'));
+  assert.equal(floor.kind, 'both-modified');
+  assert.equal(floor.untouched, true, 'neither side edited it — only its folder moved');
+  const fence = st.files.find(f => f.path.endsWith('Old_Fence_Tile.png'));
+  assert.equal(fence.kind, 'both-added');
+  assert.equal(fence.untouched, false, 'it has no ancestor to be unchanged from');
+
+  // Taking either side is genuinely free, and finishes the merge.
+  for (const f of st.files) await conflicts.resolveFile(dir, f.path, 'theirs');
+  const done = await conflicts.proceed(dir);
+  assert.equal(done.done, true);
+  assert.equal((await gitOps.status(dir)).clean, true);
+});
+
+test('a suggestion that echoes the surrounding context is trimmed, not duplicated', async (t) => {
+  const { dir, read } = conflictedRepo(t);
+  await gitOps.merge(dir, 'other');
+  const ctx = await conflicts.aiContext(dir, 'shared.txt', null);
+  const hunk = ctx.hunks[0];
+  assert.equal(hunk.before, 'alpha');
+  assert.equal(hunk.after, 'gamma\ndelta\nepsilon');
+
+  /*
+   * Observed with a real local model: asked to combine three disputed lines it answers with
+   * the whole surrounding function — the disputed lines PLUS the closing brace and return
+   * below them, because that is what "the resolved code" looks like. Applied verbatim those
+   * echoed lines land in the file twice, in a commit about to be made.
+   */
+  const restore = llm.providers.resolve;
+  llm.providers.resolve = async () => ({
+    async chat() {
+      return {
+        content: JSON.stringify({
+          hunks: [{
+            index: hunk.index, choice: 'custom', confidence: 0.9, why: 'combine them',
+            text: 'alpha\nB-combined\ngamma\ndelta\nepsilon',
+          }],
+        }),
+      };
+    },
+  });
+  let suggestion;
+  try {
+    suggestion = (await llm.resolveConflict({ model: 'm' }, ctx)).hunks[0];
+  } finally { llm.providers.resolve = restore; }
+
+  assert.equal(suggestion.text, 'B-combined');
+
+  // Applied, it replaces only the disputed region and leaves the context exactly once.
+  const d = await conflicts.file(dir, 'shared.txt');
+  await conflicts.resolveHunks(dir, 'shared.txt',
+    [{ index: suggestion.index, choice: 'custom', text: suggestion.text }], { expect: d.fingerprint });
+  const text = read('shared.txt');
+  assert.match(text, /^alpha\nB-combined\ngamma\ndelta\nepsilon\nzeta$/m);
+  assert.equal(text.split('\n').filter(l => l === 'gamma').length, 1);
+});
+
+test('the assistant can read the repository but only what git tracks', async (t) => {
+  const { dir, run } = scratchRepo(t);
+  fs.mkdirSync(path.join(dir, 'lib'));
+  fs.writeFileSync(path.join(dir, 'lib', 'search.js'), 'function dependencies(issues) {\n  return issues;\n}\n');
+  fs.writeFileSync(path.join(dir, 'README.md'), '# demo\n');
+  run('add', '.'); run('commit', '-qm', 'seed');
+  // Untracked, and exactly the kind of file that must stay unreadable.
+  fs.writeFileSync(path.join(dir, '.env'), 'SECRET_TOKEN=hunter2\n');
+
+  const listed = await workspace.listFiles(dir, {});
+  assert.deepEqual(listed.files.sort(), ['README.md', 'lib/search.js']);
+  assert.deepEqual((await workspace.listFiles(dir, { prefix: 'lib/' })).files, ['lib/search.js']);
+  assert.deepEqual((await workspace.listFiles(dir, { ext: 'md' })).files, ['README.md']);
+
+  const read = await workspace.readFile(dir, 'lib/search.js');
+  assert.match(read.content, /^1\tfunction dependencies/);   // line numbers, so evidence can cite them
+  assert.equal(read.lines, 4);
+
+  const found = await workspace.searchCode(dir, 'dependencies');
+  assert.deepEqual(found.matches.map(m => [m.file, m.line]), [['lib/search.js', 1]]);
+  assert.deepEqual((await workspace.searchCode(dir, 'nothing here at all')).matches, []);
+
+  // The untracked secret is invisible to every one of them, and so is anything above the repo.
+  assert.equal(listed.files.includes('.env'), false);
+  assert.match((await workspace.readFile(dir, '.env')).error, /not a tracked file/);
+  assert.match((await workspace.readFile(dir, '../../../etc/passwd')).error, /not a tracked file/);
+  assert.equal((await workspace.searchCode(dir, 'hunter2')).matches.length, 0);
+  // A wrong guess suggests the near miss rather than dead-ending.
+  assert.deepEqual((await workspace.readFile(dir, 'src/search.js')).didYouMean, ['lib/search.js']);
+
+  const map = await workspace.fileMap(dir);
+  assert.match(map, /lib\/\s+search\.js/);
+});
+
+test('the assistant proposes closing finished work, and never closes it', async () => {
+  const ctx = {
+    issues: [
+      { n: 9, t: 'Add dependency tracking', st: 'OPEN', ms: null, l: [], a: [], bx: [0, 0], bl: [] },
+      { n: 3, t: 'Already done', st: 'CLOSED', ms: null, l: [], a: [], bx: [0, 0], bl: [] },
+    ],
+    milestones: [], labels: [],
+  };
+  const good = await assistant.runTool('propose_issue_close', {
+    number: 9, reason: 'completed',
+    comment: 'Implemented in lib/search.js:316 — dependencies() has been there since the pull rewrite.',
+    rationale: 'The code already does this.',
+  }, ctx);
+  assert.equal(good.staged, false);                       // nothing is ever written here
+  assert.equal(good.proposal.kind, 'close');
+  assert.deepEqual(good.proposal.payload, {
+    number: 9, reason: 'completed',
+    comment: 'Implemented in lib/search.js:316 — dependencies() has been there since the pull rewrite.',
+  });
+  assert.deepEqual(good.proposal.notes, []);
+  // The payload is exactly what the queue's close kind accepts, since that is where it goes.
+  assert.deepEqual(KINDS.close.argv(KINDS.close.validate(good.proposal.payload, ctx)),
+    ['issue', 'close', '9', '--reason', 'completed', '--comment', good.proposal.payload.comment]);
+
+  // "It's done, trust me" is still proposable, but it is flagged as unevidenced.
+  const vague = await assistant.runTool('propose_issue_close',
+    { number: 9, rationale: 'I think it is done' }, ctx);
+  assert.match(vague.proposal.notes[0], /cites no file/);
+
+  assert.match((await assistant.runTool('propose_issue_close', { number: 3, rationale: 'x' }, ctx)).error, /already closed/);
+  assert.match((await assistant.runTool('propose_issue_close', { number: 99, rationale: 'x' }, ctx)).error, /No issue #99/);
+  // Code tools with no repository open say so rather than returning a misleading empty list.
+  assert.match((await assistant.runTool('search_code', { query: 'x' }, ctx)).error, /No repository is open/);
+});
+
+test('the assistant is told to check the code before proposing work', () => {
+  const prompt = assistant.systemPrompt({ repo: 'o/r', dir: '/tmp/x', issuesLoaded: true, git: { branch: 'main' } });
+  assert.match(prompt, /THE TRACKER IS NOT THE PROJECT/);
+  assert.match(prompt, /An open issue does NOT mean the work is undone/);
+  assert.match(prompt, /propose_issue_close/);
+  assert.match(prompt, /NEVER suggest reset --hard/);
+  assert.ok(assistant.TOOL_NAMES.has('search_code'));
+  assert.ok(assistant.TOOL_NAMES.has('read_file'));
+  // Still no way to write anything, which is the invariant all of this hangs off.
+  assert.equal([...assistant.TOOL_NAMES].some(n => /^(run|exec|write|apply|push|delete)/.test(n)), false);
+});
+
+/* ── dependency proposals ─────────────────────────────────────────
+ *
+ * A dependency in this app is a sentence in an issue body, not a field. Everything here turns
+ * on that: proposing one is a body edit, and the edit has to survive the parser reading it
+ * back, which is the round trip these cover.
+ */
+
+const issueOps = require('../lib/issues');
+const searchOps = require('../lib/search');
+
+test('a declared dependency round-trips through the issue body', () => {
+  const first = issueOps.withBlockedBy('Some existing text.', [4, 7]);
+  assert.equal(first, 'Some existing text.\n\nBlocked by: #4, #7');
+  assert.deepEqual(issueOps.blockedBy(first), [4, 7]);
+
+  // A second edge extends the line that is there rather than adding a competing one.
+  const second = issueOps.withBlockedBy(first, [9]);
+  assert.equal(second, 'Some existing text.\n\nBlocked by: #4, #7, #9');
+  assert.deepEqual(issueOps.blockedBy(second), [4, 7, 9]);
+
+  // Nothing to add is null, so a caller can tell it apart from a rewritten body.
+  assert.equal(issueOps.withBlockedBy(second, [4]), null);
+  assert.equal(issueOps.withBlockedBy('x', []), null);
+  assert.equal(issueOps.withBlockedBy('', [3]), 'Blocked by: #3');
+  // An existing bold-markdown line is extended in place, keeping its own formatting.
+  assert.equal(issueOps.withBlockedBy('**Blocked by:** #2\n\nrest', [5]),
+    '**Blocked by:** #2, #5\n\nrest');
+  // The body is never otherwise disturbed.
+  assert.match(issueOps.withBlockedBy('- [ ] a\n- [ ] b', [1]), /^- \[ \] a\n- \[ \] b\n\nBlocked by: #1$/);
+});
+
+test('a dependency that would close a loop is refused, not drawn', () => {
+  const issues = [
+    { n: 1, bk: [] }, { n: 2, bk: [1] }, { n: 3, bk: [2] },
+  ];
+  assert.equal(searchOps.wouldCycle(issues, 3, 1), false);   // deepening a chain is fine
+  assert.equal(searchOps.wouldCycle(issues, 1, 3), true);    // closing it is not
+  assert.equal(searchOps.wouldCycle(issues, 2, 2), true);    // nor is self-blocking
+  // Edges accepted earlier in the same batch count, or a set of individually-fine proposals
+  // still closes a loop once all of them are applied.
+  assert.equal(searchOps.wouldCycle(issues, 1, 4, [[4, 3]]), true);
+});
+
+test('proposed dependency edges are validated against the live tracker', () => {
+  const issues = [
+    { n: 1, t: 'Foundation', st: 'OPEN', bk: [] },
+    { n: 2, t: 'Consumer', st: 'OPEN', bk: [] },
+    { n: 3, t: 'Already linked', st: 'OPEN', bk: [1] },
+    { n: 4, t: 'Finished', st: 'CLOSED', bk: [] },
+  ];
+  const { deps, rejected } = searchOps.normalizeDeps([
+    { blocked: 2, blockedBy: [1], why: 'Needs the API #1 creates.' },
+    { blocked: 3, blockedBy: [1], why: 'Already written down.' },
+    { blocked: 2, blockedBy: [4], why: 'Blocker is closed.' },
+    { blocked: 2, blockedBy: [2], why: 'Itself.' },
+    { blocked: 1, blockedBy: [2], why: 'Would be circular given the first edge.' },
+    { blocked: 99, blockedBy: [1], why: 'No such issue.' },
+    { blocked: 4, blockedBy: [1], why: 'Blocked issue is closed.' },
+  ], { issues });
+
+  assert.deepEqual(deps, [{ blocked: 2, title: 'Consumer', blockedBy: [1], why: 'Needs the API #1 creates.' }]);
+  const why = rejected.map(r => r.reason);
+  assert.ok(why.some(r => /already declares/.test(r)));
+  assert.ok(why.some(r => /#4 is closed/.test(r)));
+  assert.ok(why.some(r => /cannot block itself/.test(r)));
+  assert.ok(why.some(r => /circular/.test(r)));
+  assert.ok(why.some(r => /no issue #99/.test(r)));
+  // One bad edge must never take a good one with it.
+  assert.equal(deps.length, 1);
+});
+
+test('the assistant proposes a dependency as a body edit it can never apply', async () => {
+  const ctx = {
+    issues: [
+      { n: 1, t: 'Build the parser', st: 'OPEN', bk: [], body: 'Parser work.' },
+      { n: 2, t: 'Use the parser', st: 'OPEN', bk: [], body: 'Consumer work.' },
+      { n: 5, t: 'Done already', st: 'CLOSED', bk: [], body: '' },
+    ],
+    milestones: [], labels: [],
+  };
+  const good = await assistant.runTool('propose_dependency',
+    { blocked: 2, blocked_by: [1], rationale: '#2 consumes the parser #1 builds.' }, ctx);
+  assert.equal(good.staged, false);
+  assert.equal(good.proposal.kind, 'edit');            // the queue kind that already exists
+  assert.equal(good.proposal.payload.number, 2);
+  assert.equal(good.proposal.payload.body, 'Consumer work.\n\nBlocked by: #1');
+  assert.deepEqual(issueOps.blockedBy(good.proposal.payload.body), [1]);
+  // And it is a payload the queue really accepts, since that is where the card sends it.
+  assert.deepEqual(KINDS.edit.argv(KINDS.edit.validate(good.proposal.payload, ctx)),
+    ['issue', 'edit', '2', '--body', 'Consumer work.\n\nBlocked by: #1']);
+
+  const closed = await assistant.runTool('propose_dependency',
+    { blocked: 2, blocked_by: [5], rationale: 'x' }, ctx);
+  assert.match(closed.error, /None of those dependencies could be declared/);
+  assert.ok(closed.notes.some(n => /#5 is already closed/.test(n)));
+
+  const self = await assistant.runTool('propose_dependency',
+    { blocked: 2, blocked_by: [2], rationale: 'x' }, ctx);
+  assert.ok(self.notes.some(n => /cannot block itself/.test(n)));
+
+  // A mixed batch keeps the good half and explains the rest.
+  const mixed = await assistant.runTool('propose_dependency',
+    { blocked: 2, blocked_by: [1, 99], rationale: 'x' }, ctx);
+  assert.deepEqual(issueOps.blockedBy(mixed.proposal.payload.body), [1]);
+  // When a proposal survives, its notes travel on the card; only a total rejection is a
+  // top-level error. Both carry the reason, so nothing is dropped silently either way.
+  assert.ok(mixed.proposal.notes.some(n => /no issue #99/.test(n)));
+
+  assert.ok(assistant.TOOL_NAMES.has('propose_dependency'));
+  assert.match(assistant.systemPrompt({ repo: 'o/r', dir: '/x' }), /ORDERING CONSTRAINTS/);
+});
+
+test('a plan can be asked for the ordering and nothing else', async (t) => {
+  const seen = [];
+  const mock = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      seen.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      // The model answers with extras anyway; the switch has to hold regardless.
+      res.end(JSON.stringify({ message: { content: JSON.stringify({
+        ranked: [{ numbers: [2], tag: 'first', why: 'Foundation.' }],
+        gaps: [{
+          title: 'An unwanted extra', body: 'x', milestone: '', labels: [], tag: 'x',
+          rationale: 'x', impact: 'x', risk: false, priority: 0,
+        }],
+        deps: [{ blocked: 1, blockedBy: [2], why: 'Needs it.' }],
+      }) } }));
+    });
+  });
+  try {
+    await new Promise((resolve, reject) => { mock.once('error', reject); mock.listen(0, '127.0.0.1', resolve); });
+  } catch (error) {
+    if (error && error.code === 'EPERM') { t.skip('this environment does not permit loopback listeners'); return; }
+    throw error;
+  }
+  t.after(() => new Promise(resolve => mock.close(resolve)));
+
+  const cfg = { endpoint: `http://127.0.0.1:${mock.address().port}`, provider: 'ollama', model: 'test-model', timeoutMs: 5000 };
+  const issues = [
+    { n: 1, t: 'Consumer', st: 'OPEN', ms: null, bx: [0, 0], bl: [], bk: [], body: '' },
+    { n: 2, t: 'Foundation', st: 'OPEN', ms: null, bx: [0, 0], bl: [], bk: [], body: '' },
+  ];
+
+  // Default: both extras are asked for and come back.
+  const full = await llm.planInsights(cfg, { issues, milestones: [], labels: [], count: 5 });
+  assert.equal(full.gaps.length, 1);
+  assert.deepEqual(full.deps, [{ blocked: 1, blockedBy: [2], why: 'Needs it.' }]);
+  assert.match(seen[0].messages[0].content, /DEPENDENCIES \(at most 8\)/);
+
+  // Switched off: the prompt says so, and the answer is discarded even though it arrived.
+  const bare = await llm.planInsights(cfg, {
+    issues, milestones: [], labels: [], count: 5, gapCount: 0, wantDeps: false,
+  });
+  assert.deepEqual(bare.gaps, []);
+  assert.deepEqual(bare.deps, []);
+  assert.equal(bare.ranked.length, 1);                 // the ordering itself is untouched
+  assert.match(seen[1].messages[0].content, /return an empty array for "gaps"/);
+  assert.match(seen[1].messages[0].content, /DEPENDENCIES: return an empty array/);
+  assert.doesNotMatch(seen[1].messages[0].content, /MISSING WORK \(at most/);
 });
