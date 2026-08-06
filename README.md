@@ -137,7 +137,7 @@ you with nothing to look at.
 **Images** are shown as pictures rather than as "Binary files differ", in the same columns and
 the same colours as a text conflict, with each version's dimensions and byte size underneath
 and a warning when the two sides are different sizes. Transparency is drawn against a
-checkerboard and pixels are kept square, because most of these are sprites. See
+checkerboard and pixels are kept square, because most of these (for me) are sprites. See
 [Image previews](#image-previews).
 
 **When both sides are byte-identical**, the view says so instead of offering a choice between
