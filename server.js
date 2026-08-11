@@ -42,8 +42,9 @@ const { Queue } = require('./lib/queue');
 const prs = require('./lib/prs');
 const llm = require('./lib/llm');
 const planOps = require('./lib/plans');
+const muteOps = require('./lib/mutes');
 const assistant = require('./lib/assistant');
-const { Jobs, isCancel } = require('./lib/jobs');
+const { Jobs, isCancel, CancelError } = require('./lib/jobs');
 const { createAccess, AccessError } = require('./lib/access');
 const search = require('./lib/search');
 const workspace = require('./lib/workspace');
@@ -64,7 +65,7 @@ const CSP_NONCE = crypto.randomBytes(18).toString('base64');
  *
  * BUMP IT whenever you add, remove or rename a route.
  */
-const API_VERSION = 6;
+const API_VERSION = 7;
 
 // Repository slugs become local cache filenames. Replace every separator and collapse
 // dot-dot so even a malformed hand-edited remote cannot escape the intended directory.
@@ -277,6 +278,14 @@ function aiConfig() {
     temperature: c.temperature == null ? 0 : c.temperature,
     timeoutMs: c.timeoutMs || 300000,
     numCtx: c.numCtx || 8192,
+    /*
+     * How long a local model stays loaded between requests, in minutes. Ollama's own default
+     * is five, which is shorter than the pause between reading a plan and asking about it —
+     * so the usual rhythm of this app pays a full model load on nearly every action. Thirty
+     * covers a working session; 0 restores the server's own behaviour and -1 keeps it
+     * resident indefinitely. Providers with no notion of residency ignore it.
+     */
+    keepAliveMinutes: c.keepAliveMinutes == null ? 30 : Number(c.keepAliveMinutes),
   };
 }
 
@@ -296,17 +305,46 @@ const CHAT_NUM_CTX = 16384;
 const idxFile = (slug) => path.join(CONFIG_DIR, 'embeddings', slugKey(slug) + '.json');
 const legacyIdxFile = (slug) => path.join(LEGACY_CONFIG_DIR, 'embeddings', slugKey(slug) + '.json');
 
+/*
+ * The parsed index, kept in memory and revalidated by mtime.
+ *
+ * This file is the largest thing the app reads: a few hundred issues at 768 floats each is
+ * several megabytes of JSON, and JSON.parse of it is tens of milliseconds of blocked event
+ * loop. It is read on every semantic lookup — every duplicate scan, every search, and every
+ * find_similar_issues the assistant makes mid-conversation — so the same megabytes were being
+ * re-parsed several times inside a single answer. Keyed by mtime and size so a hand-edited or
+ * externally replaced file is still noticed.
+ */
+const INDEX_CACHE = new Map();       // file -> { key, idx }
+
+function readIndexFile(file) {
+  let stat;
+  try { stat = fs.statSync(file); } catch { return null; }
+  const key = stat.mtimeMs + ':' + stat.size;
+  const hit = INDEX_CACHE.get(file);
+  if (hit && hit.key === key) return hit.idx;
+  try {
+    const idx = JSON.parse(fs.readFileSync(file, 'utf8'));
+    INDEX_CACHE.set(file, { key, idx });
+    return idx;
+  } catch { return null; }
+}
+
 function loadIndex(slug) {
-  try { return JSON.parse(fs.readFileSync(idxFile(slug), 'utf8')); }
-  catch {
-    try { return JSON.parse(fs.readFileSync(legacyIdxFile(slug), 'utf8')); }
-    catch { return { model: null, dim: 0, items: {} }; }
-  }
+  return readIndexFile(idxFile(slug))
+    || readIndexFile(legacyIdxFile(slug))
+    || { model: null, dim: 0, items: {} };
 }
 function saveIndex(slug, idx) {
   try {
     fs.mkdirSync(path.join(CONFIG_DIR, 'embeddings'), { recursive: true });
-    fs.writeFileSync(idxFile(slug), JSON.stringify(idx), { mode: 0o600 });
+    const file = idxFile(slug);
+    fs.writeFileSync(file, JSON.stringify(idx), { mode: 0o600 });
+    // Adopt what was just written rather than waiting to re-read and re-parse it.
+    try {
+      const stat = fs.statSync(file);
+      INDEX_CACHE.set(file, { key: stat.mtimeMs + ':' + stat.size, idx });
+    } catch { INDEX_CACHE.delete(file); }
   } catch (e) { console.error('  ! could not save embedding index: ' + e.message); }
 }
 const ignFile = (slug) => path.join(CONFIG_DIR, 'ignored', slugKey(slug) + '.json');
@@ -326,14 +364,58 @@ function saveIgnored(slug, list) {
 }
 const ignKey = (t) => String(t).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
 
+/*
+ * Muted plan entries and refused dependency edges — see lib/mutes.js for why this is a
+ * separate list from the ignore one above. Same per-repo, 0600, hand-editable file shape.
+ */
+const muteFile = (slug) => path.join(CONFIG_DIR, 'muted', slugKey(slug) + '.json');
+function loadMutes(slug) {
+  if (!slug) return muteOps.empty();
+  try { return muteOps.normalize(JSON.parse(fs.readFileSync(muteFile(slug), 'utf8'))); }
+  catch { return muteOps.empty(); }
+}
+function saveMutes(slug, value) {
+  try {
+    fs.mkdirSync(path.join(CONFIG_DIR, 'muted'), { recursive: true });
+    fs.writeFileSync(muteFile(slug), JSON.stringify(muteOps.normalize(value), null, 2), { mode: 0o600 });
+  } catch (e) { console.error('  ! could not save the hidden-plan list: ' + e.message); }
+}
+
+/* The rejected edges as plain pairs — what the prompt, the plan filter and the chat tool all
+ * want, none of which should have to parse a key format. */
+function rejectedDeps(slug) {
+  return loadMutes(slug).deps.map(entry => {
+    const [blocked, blockedBy] = muteOps.numbersFromKey(entry.key);
+    return Number.isInteger(blocked) && Number.isInteger(blockedBy) ? { blocked, blockedBy } : null;
+  }).filter(Boolean);
+}
+
+/*
+ * Strip refused edges out of a freshly proposed batch, per edge rather than per card. A
+ * proposal that says "#9 waits on #5 and #7" where only #7 was refused keeps #5 and stops
+ * being a proposal at all when nothing is left.
+ */
+function dropRefusedDeps(deps, refused) {
+  if (!refused || !refused.length) return deps || [];
+  const no = new Set(refused.map(d => d.blocked + ':' + d.blockedBy));
+  return (deps || []).map(dep => {
+    const keep = (dep.blockedBy || []).filter(n => !no.has(dep.blocked + ':' + n));
+    return keep.length ? Object.assign({}, dep, { blockedBy: keep }) : null;
+  }).filter(Boolean);
+}
+
 const textHash = (t) => crypto.createHash('sha1').update(t).digest('hex').slice(0, 16);
 
-async function buildIndex(dir, slug, cfg, { force = false, signal = null } = {}) {
+async function buildIndex(dir, slug, cfg, { force = false, signal = null, progress = false } = {}) {
   const cache = cachedIssues(dir);
   if (!cache) throw new HttpError(400, 'Pull issues first');
-  let idx = loadIndex(slug);
-  // A different embedding model produces incompatible vectors — start clean.
-  if (force || idx.model !== cfg.embedModel) idx = { model: cfg.embedModel, dim: 0, items: {} };
+  const stored = loadIndex(slug);
+  // A different embedding model produces incompatible vectors — start clean. Otherwise take a
+  // shallow copy: the cached object above is shared, and mutating it before a save that may
+  // never happen would leave memory disagreeing with the file it claims to mirror.
+  const idx = force || stored.model !== cfg.embedModel
+    ? { model: cfg.embedModel, dim: 0, items: {} }
+    : { model: stored.model, dim: stored.dim, items: Object.assign({}, stored.items) };
 
   const need = [];
   for (const i of cache.issues) {
@@ -343,12 +425,31 @@ async function buildIndex(dir, slug, cfg, { force = false, signal = null } = {})
     if (!have || have.h !== hv) need.push({ n: i.n, txt, h: hv });
   }
   if (need.length) {
+    /*
+     * Batches in parallel, not one after another.
+     *
+     * Embedding is the one model call with no reasoning in it — a batch is pure throughput,
+     * and an embedding server is perfectly happy to work on several at once. Re-indexing a
+     * few hundred issues was a strictly serial walk through chunks of 32, which on a first
+     * run is the longest any button in this app makes you wait. Concurrency is the same knob
+     * classification uses, so one setting governs how hard the endpoint is pushed.
+     */
     const B = 32;
-    for (let k = 0; k < need.length; k += B) {
-      const batch = need.slice(k, k + B);
+    const batches = [];
+    for (let k = 0; k < need.length; k += B) batches.push(need.slice(k, k + B));
+    // Only the explicit "build index" run owns the progress counter; a retrieval build that
+    // happens inside classification must not overwrite the count of issues being classified.
+    const done = await llm.pool(batches, cfg.concurrency || 2, async (batch) => {
       const vecs = await llm.embed(cfg, batch.map(b => b.txt), signal);
-      batch.forEach((b, j) => { idx.items[b.n] = { h: b.h, v: vecs[j] }; });
-      idx.dim = (vecs[0] && vecs[0].length) || idx.dim;
+      return { batch, vecs };
+    }, progress ? signal : null);
+    const failure = done.find(r => r && r.error);
+    if (failure) throw new Error(failure.error);
+    if (done.some(r => r && r.cancelled)) throw new CancelError();
+    for (const r of done) {
+      if (!r || !r.vecs) continue;
+      r.batch.forEach((b, j) => { idx.items[b.n] = { h: b.h, v: r.vecs[j] }; });
+      idx.dim = (r.vecs[0] && r.vecs[0].length) || idx.dim;
     }
     // Drop entries for issues that no longer exist.
     const live = new Set(cache.issues.map(i => i.n));
@@ -514,6 +615,9 @@ async function buildState({ fresh = false } = {}) {
     planStatus: planStatus(sel.github || sel.name, issues),
     ignoredCount: loadIgnored(sel.github || sel.name).length,
     ignoredTitles: loadIgnored(sel.github || sel.name).map(x => x.title),
+    // Full entries, not just keys: the Plan view lists them so a hidden entry can be found
+    // and restored without regenerating anything.
+    planMutes: loadMutes(sel.github || sel.name),
     aiJobs: jobs.active(),
   });
 }
@@ -578,13 +682,16 @@ function insightsFor(slug, milestones, issues) {
   if (!slug) return null;
   const checked = loadInsights(slug);
   const generated = generatedInsights(slug);
+  // What the reader has hidden is applied on read, so it survives regeneration and applies
+  // equally to a checked-in plan, a generated one, and the programmatic fallback.
+  const muted = loadMutes(slug);
   let selected = checked || generated;
   if (checked && generated) {
     const newer = String(generated.capturedAt || '') > String(checked.capturedAt || '');
     selected = (checked.showcase || newer) ? generated : checked;
   }
-  if (selected) return planOps.hydratePlan(selected, milestones, issues);
-  return milestones.length ? planOps.programmaticPlan(slug, milestones, issues) : null;
+  if (selected) return planOps.hydratePlan(selected, milestones, issues, muted);
+  return milestones.length ? planOps.programmaticPlan(slug, milestones, issues, 10, muted) : null;
 }
 
 /* ── routes ──────────────────────────────────────────────────────── */
@@ -934,6 +1041,11 @@ const routes = {
       temperature: body.temperature == null ? (old.temperature || 0) : Math.max(0, Math.min(Number(body.temperature), 1)),
       timeoutMs: Math.max(10000, Math.min(Number(body.timeoutMs) || old.timeoutMs || 300000, 1800000)),
       numCtx: Math.max(2048, Math.min(Number(body.numCtx) || old.numCtx || 8192, 131072)),
+      // -1 (keep forever) through 0 (the provider's own default) to a day. Number() is used
+      // rather than || so that an explicit 0 is honoured instead of falling back to 30.
+      keepAliveMinutes: body.keepAliveMinutes === undefined
+        ? (old.keepAliveMinutes == null ? 30 : old.keepAliveMinutes)
+        : Math.max(-1, Math.min(Number(body.keepAliveMinutes) || 0, 1440)),
     });
     // Switching models evicts the old one rather than leaving two competing for VRAM.
     // Endpoints with no notion of residency report `skipped` and nothing is claimed.
@@ -1012,6 +1124,69 @@ const routes = {
   }),
   'GET /api/ai/ignored': async () => withRepo(() =>
     ({ ok: true, ignored: loadIgnored(repos.selected.github || repos.selected.name) })),
+
+  /*
+   * Hiding part of a plan.
+   *
+   * Deliberately not under /api/ai: nothing here calls a model, nothing is staged, and it
+   * works exactly the same on the programmatic plan a repository with no assistant gets. It
+   * is an opinion about a local file, which is why it is instant and why it is reversible.
+   */
+  'POST /api/plan/mute': async (_q, body) => withRepo(() => {
+    const slug = repos.selected.github || repos.selected.name;
+    const kind = String(body.kind || 'items');
+    if (!muteOps.KINDS.includes(kind)) throw new HttpError(400, 'Hide what? Expected "items" or "deps"');
+    /*
+     * A dependency is muted by its two numbers rather than by a key the browser composed, so
+     * the key format lives in one place and a hand-written request cannot invent a shape the
+     * plan reader will never match.
+     */
+    const key = kind === 'deps'
+      ? muteOps.depKey(body.blocked, body.blockedBy)
+      : String(body.key || '').trim();
+    if (!key) {
+      throw new HttpError(400, kind === 'deps'
+        ? 'A rejected dependency needs both issue numbers'
+        : 'Nothing to hide');
+    }
+    const { mutes, changed } = muteOps.add(loadMutes(slug), kind, key, body.label);
+    if (changed) saveMutes(slug, mutes);
+    return {
+      ok: true, planMutes: mutes,
+      message: kind === 'deps'
+        ? `Rejected — #${Number(body.blocked)} waiting on #${Number(body.blockedBy)} will not be proposed again`
+        : 'Hidden — it stays in the plan but out of the way. Nothing was staged.',
+    };
+  }),
+  'POST /api/plan/unmute': async (_q, body) => withRepo(() => {
+    const slug = repos.selected.github || repos.selected.name;
+    const kind = String(body.kind || 'items');
+    if (!muteOps.KINDS.includes(kind)) throw new HttpError(400, 'Restore what? Expected "items" or "deps"');
+    const key = kind === 'deps' && body.key == null
+      ? muteOps.depKey(body.blocked, body.blockedBy)
+      : String(body.key || '').trim();
+    const { mutes, changed } = muteOps.remove(loadMutes(slug), kind, key);
+    if (!changed) throw new HttpError(400, 'That is not hidden');
+    saveMutes(slug, mutes);
+    return {
+      ok: true, planMutes: mutes,
+      message: kind === 'deps' ? 'Restored — it can be proposed again' : 'Restored to the plan',
+    };
+  }),
+  'POST /api/plan/mutes/clear': async (_q, body) => withRepo(() => {
+    const slug = repos.selected.github || repos.selected.name;
+    const kind = body && body.kind ? String(body.kind) : null;
+    if (kind && !muteOps.KINDS.includes(kind)) throw new HttpError(400, 'Clear what? Expected "items" or "deps"');
+    const { mutes, cleared } = muteOps.clear(loadMutes(slug), kind);
+    if (!cleared) throw new HttpError(400, 'Nothing is hidden');
+    saveMutes(slug, mutes);
+    return {
+      ok: true, planMutes: mutes,
+      message: `Restored ${cleared} hidden ${cleared === 1 ? 'entry' : 'entries'}`,
+    };
+  }),
+  'GET /api/plan/mutes': async () => withRepo(() =>
+    ({ ok: true, planMutes: loadMutes(repos.selected.github || repos.selected.name) })),
 
   /* Cancelling only ever abandons a proposal — no git or gh work runs under a job. */
   'POST /api/ai/cancel': async (_q, body) => {
@@ -1117,6 +1292,24 @@ const routes = {
     // The repository's own file list, so a gap proposal has to survive contact with what the
     // project already contains rather than only with what the tracker says it lacks.
     const fileMap = await workspace.fileMap(dir).catch(() => null);
+    /*
+     * What the reader already corrected about the last plan. Hiding an entry and refusing an
+     * edge are the only feedback this app collects about the ORDER rather than the work, and
+     * a regenerated plan that does not see them undoes both instantly — which is what makes
+     * "regenerate" feel like arguing with the model rather than directing it.
+     */
+    const muted = loadMutes(slug);
+    const refusedDeps = rejectedDeps(slug);
+    const byNumber = new Map(cache.issues.map(issue => [issue.n, issue]));
+    const hiddenItems = muted.items.map(entry => {
+      const numbers = muteOps.numbersFromKey(entry.key);
+      return {
+        numbers,
+        label: entry.label
+          || numbers.map(n => (byNumber.get(n) || {}).t).filter(Boolean).join(' · ')
+          || null,
+      };
+    }).filter(item => item.numbers.length || item.label);
     const generated = await underJob(body, revising ? 'plan-update' : 'plan', (signal) =>
       llm.planInsights(cfg, {
         issues: planningIssues,
@@ -1130,6 +1323,8 @@ const routes = {
         currentPlan: revising ? existing : null,
         changed: revising ? { added: drift.added, closed: drift.closed } : null,
         fileMap,
+        hiddenItems,
+        ignoredDeps: refusedDeps,
       }, signal));
     const gaps = planOps.normalizeGeneratedGaps(generated.gaps, {
       milestones: m.milestones,
@@ -1144,13 +1339,17 @@ const routes = {
     const editorial = planOps.mergeRankedGaps(generated.ranked, gaps);
     // Edges are checked against the live tracker, not against what the model was shown: a
     // stale number, a closed issue or a loop all have to be dropped here rather than drawn.
-    const { deps, rejected: depsRejected } = search.normalizeDeps(generated.deps, {
+    const { deps: validDeps, rejected: depsRejected } = search.normalizeDeps(generated.deps, {
       issues: cache.issues,
     });
     if (depsRejected.length) {
       console.error(`  ! dropped ${depsRejected.length} proposed dependenc(ies): ` +
         depsRejected.map(r => r.reason).join('; ').slice(0, 300));
     }
+    // The prompt asks the model not to re-propose a refused edge; this is what guarantees it.
+    // A card the reader has already said no to must never come back, however the model
+    // rephrases it.
+    const deps = dropRefusedDeps(validDeps, refusedDeps);
     // Persist only the model's editorial contribution. Dates, milestone membership,
     // completion, fallback entries, and milestone order are derived from GitHub on read.
     const saved = {
@@ -1178,7 +1377,9 @@ const routes = {
       fs.mkdirSync(path.join(CONFIG_DIR, 'plans'), { recursive: true });
       fs.writeFileSync(genFile(slug), JSON.stringify(saved, null, 2), { mode: 0o600 });
     } catch (e) { console.error('  ! could not save plan: ' + e.message); }
-    const plan = planOps.hydratePlan(saved, m.milestones, cache.issues);
+    // Mutes apply to the freshly generated plan too, or a regenerate would visibly undo every
+    // hide the reader had made — the one thing "survives regeneration" has to mean.
+    const plan = planOps.hydratePlan(saved, m.milestones, cache.issues, muted);
     return {
       ok: true, plan, planStatus: planStatus(slug, cache.issues),
       message: `${revising ? 'Updated' : 'Built'} a ${plan.ranked.length}-step plan with ${gaps.length} missing-work insight${gaps.length === 1 ? '' : 's'}` +
@@ -1243,7 +1444,10 @@ const routes = {
       // blocked by classified ones, which are not in `pick`.
       { issues: pick, milestones: m.milestones, labels: m.labels, corpus, allIssues: cache.issues },
       signal);
-    const { proposals, newMilestones, newLabels, deps } = out;
+    const { proposals, newMilestones, newLabels } = out;
+    // Classification proposes edges too, and a refusal made in the Plan view has to hold here
+    // as well — otherwise the same rejected dependency reappears under a different button.
+    const deps = dropRefusedDeps(out.deps, rejectedDeps(repos.selected.github || repos.selected.name));
     const n = proposals.filter(p => p.changed).length;
     const nominated = newMilestones.length + newLabels.length;
     return {
@@ -1330,6 +1534,10 @@ const routes = {
       git: { branch: status && status.branch, status, log },
       plan: insightsFor(slug, (meta && meta.milestones) || [], issues),
       planName: planFileFor(dir),
+      // Decisions the user has already made about proposals, so the assistant stops
+      // re-offering them. Both lists are the same ones the Plan view acts on.
+      ignoredTitles: loadIgnored(slug).map(x => x.title),
+      rejectedDeps: rejectedDeps(slug),
       numCtx: Math.max(cfg.numCtx || 0, CHAT_NUM_CTX),
       // Semantic search reuses the same index classification builds, when there is one.
       findSimilar: cfg.embedModel ? async (text, limit) => {

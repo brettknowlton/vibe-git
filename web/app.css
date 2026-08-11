@@ -232,6 +232,14 @@ h3{font-size:14px; margin:0; font-weight:600}
   letter-spacing:.09em; text-transform:uppercase}
 .chip.tap:hover{border-color:var(--fg-mid); color:var(--fg)}
 .chip.tap[aria-pressed="true"]{background:var(--fill); border-color:var(--fill); color:var(--fill-fg)}
+/* A refused dependency edge. Struck rather than removed, so the card still shows what was
+   proposed and what you decided about it. */
+.chip.struck{opacity:.5; text-decoration:line-through; text-decoration-thickness:1px}
+/* A chip that carries its own dismiss button. */
+.chipwrap{display:inline-flex; align-items:center; gap:2px}
+.chip.x{background:none; cursor:pointer; font:inherit; font-family:var(--mono); font-size:9.5px;
+  padding:3px 5px; line-height:1; color:var(--fg-dim); border-color:var(--line-soft)}
+.chip.x:hover{border-color:var(--alarm); color:var(--alarm)}
 .tags{display:flex; gap:6px; flex-wrap:wrap; align-items:center}
 
 .empty{padding:44px 20px; text-align:center; color:var(--fg-dim); font-size:13.5px}
@@ -317,6 +325,11 @@ h3{font-size:14px; margin:0; font-weight:600}
 .card.done{opacity:.55; box-shadow:none}
 .card.done .rank{background:var(--surface2); color:var(--ok)}
 .card.done .ttl{text-decoration:line-through; text-decoration-thickness:1px}
+/* Hidden by the reader, not finished. Dimmed like completed work but deliberately NOT struck
+   through and NOT ticked: the entry is still outstanding, it is only out of the way, and a
+   card that reads as done would be a lie told by a stylesheet. */
+.card.muted{opacity:.6; box-shadow:none; border-style:dashed}
+.card.muted .rank{background:var(--surface2); color:var(--fg-dim)}
 .cbody{padding:13px 16px 14px; display:flex; flex-direction:column; gap:8px; min-width:0}
 .row1{display:flex; gap:8px; align-items:baseline; flex-wrap:wrap}
 .iss{font-family:var(--mono); font-size:12px; color:var(--fg-dim)}
@@ -907,6 +920,7 @@ pre{margin:0; background:var(--raise); border:1px solid var(--line); border-radi
    tracker records, a card is a suggestion nobody has accepted yet, and the two must never
    read as the same kind of claim. */
 .prop.dep{border-left-color:var(--p3)}
+.prop.dep.muted{opacity:.6; border-style:dashed}
 .prop.dep .why{color:var(--fg-mid); font-size:12.5px; line-height:1.55; margin:6px 0 2px}
 .prop.dep .relrow{margin-top:6px}
 .depprops{margin-bottom:22px}

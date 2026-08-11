@@ -310,11 +310,38 @@ editorial guidance:
 - Rank recommended work and explain why each item is prioritized.
 - Filter the full view to one milestone.
 - Hide completed recommendations by default, with a **Show hidden** toggle.
+- **Hide** any recommendation you do not want to see right now, without staging anything.
+- Leave completed milestones out of the header, so the timeline starts at what is next.
 - Open real issues directly in the standard issue editor.
 - Identify work described by a plan but not represented by an issue.
 - Stage a new issue from a missing-work proposal.
 - Ignore, restore, or permanently delete proposals that should not become issues.
+- **Refuse** a proposed dependency that is not a real ordering constraint.
 - Notice when the tracker has moved on since the plan was generated.
+
+#### Hiding part of a plan
+
+Between "stage this change" and "do nothing" there is a large, ordinary range of responses
+to a ranking, and it used to be empty. **Hide** on any recommendation fills it: the entry
+folds out of the way, the remaining items renumber, and **nothing is staged** — no queue
+entry, no GitHub call, no edit to any issue.
+
+Hiding is not the same as ignoring. Ignoring a proposed issue is a verdict — this is not
+work, stop suggesting it. Hiding is "not now", or "not third", and it is reversible from the
+**Show hidden** toggle at any time. Use it for the item that is real but belongs next month,
+and for the one the model simply put in the wrong place.
+
+Entries are keyed by their issue numbers, so a mute survives regeneration: an issue you
+pushed down stays down when a new plan ranks it somewhere else. Generation is also *told*
+what you hid and asked to rank it below everything you did not — which is the only feedback
+this app collects about the order rather than about the work.
+
+Completed milestones leave the header for the same reason. A milestone counts as complete
+when GitHub says it is closed, **or** when it holds issues and none are still open — the
+second because closing the milestone itself is a chore people skip for months, and a header
+that opens on a finished phase reports a due date in the past and a countdown of zero. A
+milestone with no issues at all is *empty*, not finished, and stays. **Show completed** puts
+them back.
 
 #### Dependencies
 
@@ -335,6 +362,16 @@ line, so the relationship still reads correctly to anyone looking at the issue o
 Edges are refused rather than drawn when they would be circular, point at a closed issue, or
 duplicate one already written down — and a saved plan re-checks its proposals on every read,
 so an edge that has since been recorded by hand stops being offered.
+
+You can also refuse one yourself. A model reading two issues about the same subsystem will
+sometimes declare an ordering constraint that does not exist, and the only previous way to
+stop being shown it was to stage a body edit asserting something untrue. **Refuse** on a
+dependency card rejects it instead: nothing is staged, the edge is struck through rather than
+deleted, and it will not be proposed again — not by plan generation, not by **Re-check all
+open**, and not by the chat panel, all three of which read the same refusal list. Refusal is
+per **edge**, so a card proposing three blockers that is right about two keeps those two;
+with more than one live blocker each chip carries its own ✕. **Show refused** lists what you
+turned down and takes any of it back.
 
 Milestones and issues are joined by their exact milestone title; names do not need a
 `Phase N` prefix. Milestone order, due dates, issue membership, checklist progress,
@@ -432,8 +469,40 @@ disabled until it is configured. It can:
 - Sweep the whole tracker for near-duplicate issues, with no model inference at all.
 - Report what it is doing while it does it — which action, how far through, and which file
   or issue it is reading right now.
-- Remember ignored suggestions so they are not repeatedly proposed.
-- Unload selected models when they are no longer needed.
+- Remember ignored suggestions, hidden plan entries, and refused dependency edges, so none
+  of them is repeatedly proposed.
+- Repair its own malformed JSON once before failing, so a plan over a whole tracker is not
+  discarded for a missing brace.
+- Stay loaded between requests, and unload selected models when they are no longer needed.
+
+#### Keeping the model warm
+
+Ollama drops a model after five idle minutes. That is shorter than the pause between reading
+a plan and asking a question about it, so the ordinary rhythm of using this app used to pay a
+full model load — tens of seconds on a large model — on nearly every action, for no reason
+other than an idle timer.
+
+**Keep model loaded** in Assistant settings sets that timer. It defaults to 30 minutes, which
+covers a working session; `0` restores the server's own behaviour and `-1` keeps the model
+resident until you unload it. It costs only VRAM that nothing else is asking for, and it is
+the single largest latency difference available here. Endpoints with no notion of residency —
+every hosted provider — ignore it, and the field is hidden for them.
+
+Three other things happen for the same reason:
+
+- **Independent lookups run together.** When the chat model asks for four things in one turn,
+  the four run concurrently instead of in series, and it is told in the system prompt that
+  asking for everything at once is cheaper than asking one at a time.
+- **Embedding batches run in parallel**, bounded by the same **Parallel requests** setting
+  that governs classification. Building the index on a few hundred issues was previously a
+  strictly serial walk.
+- **The embedding index is parsed once**, then held in memory and revalidated by file
+  timestamp. It is the largest file the app reads and several megabytes of it were being
+  re-parsed inside a single answer.
+
+A local model is also given a generation ceiling. Without one, a model that fails to close
+its JSON generates until the context window is full — minutes of tokens nobody will read,
+followed by a parse error.
 
 #### Duplicate detection
 
@@ -477,10 +546,21 @@ recall, and can:
 
 - Read issues, one issue in full, milestones, labels, the plan, recent commits, and the
   state of the working tree.
+- Read the tracker's whole dependency structure in one call — what is ready to start now,
+  what is waiting, and which issues unblock the most work if finished. This is the same
+  computation the Plan view draws, so the two cannot give different answers, and the model is
+  told not to claim anything is ready without consulting it.
 - Search for issues resembling a description, semantically when an embedding model is
   configured and by word overlap otherwise.
 - Propose an issue, an issue edit, a milestone, or a label — each of which becomes a card
   you stage and push like any other change.
+
+Decisions you have already made travel with the conversation. Entries hidden from the plan
+come back flagged as hidden, ignored issue ideas are named, and a dependency edge refused in
+the Plan view is refused here too — the plan and the chat panel are two doors into one
+tracker, and a rejection that only held behind one of them would not be a rejection. An
+ignored *idea* is flagged rather than blocked, because you may be asking for exactly that;
+the model is told to say so before you stage it.
 
 The tools are read-only apart from the `propose_*` family, and those only produce a payload
 for the staged-change queue, which revalidates everything against the repository. There is
@@ -608,8 +688,9 @@ Application data is stored under:
 ```
 
 This includes the repository list, settings, staged issue queue, generated plans,
-ignored suggestions, the embedding cache, and a local copy of each repository's issues
-and milestones. Newly created configuration files use owner-only permissions.
+ignored suggestions, hidden plan entries and refused dependency edges (`muted/`), the
+embedding cache, and a local copy of each repository's issues and milestones. Newly created
+configuration files use owner-only permissions.
 
 The issue copy is what the Issues, Plan and Assistant views read, so opening vibe-git
 again does not wait on `gh`; **Pull** refreshes it. It contains issue titles and bodies,
@@ -723,8 +804,15 @@ deliberately does not make for you.
 
 ### Assistant actions are slow
 
-Check whether the configured model server is using available hardware acceleration and
-whether the selected model fits in available memory. Embedding and classification work
+If the delay is at the *start* of every action and the endpoint is local, the model is
+probably being reloaded each time. Raise **Keep model loaded** in Assistant settings — the
+default of 30 minutes is already far above Ollama's own five, but a `0` there restores the
+five-minute behaviour. **Loaded in memory** in the same panel shows what is currently
+resident and what fraction of it is on the GPU; a model reported at 0% GPU is running on the
+CPU, which is the other common cause.
+
+Otherwise, check whether the configured model server is using available hardware acceleration
+and whether the selected model fits in available memory. Embedding and classification work
 can also be reduced by lowering Assistant concurrency. Any action that is taking longer
 than it is worth can be stopped with **Cancel**.
 
@@ -749,6 +837,7 @@ lib/conflicts.js  which side is which, marker parsing, and resolving them
 lib/images.js   image previews: format sniffing, header-only dimensions, data URIs
 lib/issues.js   GitHub issue reads and normalization
 lib/plans.js    deterministic milestone matching, plan hydration, drift, and ranking
+lib/mutes.js    hidden plan entries and refused dependency edges, keyed to survive rebuilds
 lib/prs.js      pull request reads and creation
 lib/queue.js    persistent, validated GitHub issue operation queue
 lib/repos.js    repository discovery, selection, cloning, and local configuration

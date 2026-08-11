@@ -2086,3 +2086,253 @@ test('a plan can be asked for the ordering and nothing else', async (t) => {
   assert.match(seen[1].messages[0].content, /DEPENDENCIES: return an empty array/);
   assert.doesNotMatch(seen[1].messages[0].content, /MISSING WORK \(at most/);
 });
+
+test('hiding a plan entry stages nothing and survives regeneration', () => {
+  const mutes = require('../lib/mutes');
+  const milestones = [{ number: 1, title: 'Release', state: 'open', dueOn: '2030-01-01', description: 'Ship it.' }];
+  const issues = [
+    { n: 1, t: 'First', st: 'OPEN', ms: 'Release', bx: [0, 0], bl: [], bk: [], body: '' },
+    { n: 2, t: 'Second', st: 'OPEN', ms: 'Release', bx: [0, 0], bl: [], bk: [], body: '' },
+  ];
+  const raw = {
+    schemaVersion: 2, generated: true, capturedAt: '2030-01-01', requestedCount: 2,
+    ranked: [
+      { ns: [1], tag: 'first', why: 'a' },
+      { ns: [2], tag: 'second', why: 'b' },
+    ],
+    gaps: [], deps: [],
+  };
+
+  // The key is derived from the issue numbers, so it is the same before and after a
+  // regeneration that reorders the entries.
+  const key = mutes.itemKey({ ns: [1] });
+  assert.equal(key, 'ns:1');
+  assert.equal(mutes.itemKey({ ns: [14, 12] }), 'ns:12,14', 'grouped entries sort, so order cannot fork the key');
+  assert.equal(mutes.itemKey({ gap: 'Document  the Recovery!' }), 'gap:document the recovery');
+
+  const { mutes: stored, changed } = mutes.add(mutes.empty(), 'items', key, '#1 First');
+  assert.equal(changed, true);
+
+  const hidden = hydratePlan(raw, milestones, issues, stored);
+  assert.equal(hidden.ranked.length, 2, 'a hidden entry is flagged, never dropped');
+  assert.equal(hidden.ranked[0].muted, true);
+  assert.equal(hidden.ranked[0].muteKey, 'ns:1');
+  assert.ok(!hidden.ranked[1].muted);
+
+  // A plan generated later that ranks the same issue in a different position stays hidden.
+  const regenerated = hydratePlan(Object.assign({}, raw, {
+    ranked: [{ ns: [2], tag: 'second', why: 'b' }, { ns: [1], tag: 'first', why: 'a' }],
+  }), milestones, issues, stored);
+  assert.equal(regenerated.ranked[1].muted, true);
+  assert.ok(!regenerated.ranked[0].muted);
+
+  const restored = mutes.remove(stored, 'items', key);
+  assert.equal(restored.changed, true);
+  assert.ok(!hydratePlan(raw, milestones, issues, restored.mutes).ranked[0].muted);
+});
+
+test('a refused dependency is refused per edge, and never proposed again', () => {
+  const mutes = require('../lib/mutes');
+  const milestones = [{ number: 1, title: 'Release', state: 'open', dueOn: null, description: 'Ship it.' }];
+  const issues = [
+    { n: 1, t: 'Consumer', st: 'OPEN', ms: 'Release', bx: [0, 0], bl: [], bk: [], body: '' },
+    { n: 2, t: 'Foundation', st: 'OPEN', ms: 'Release', bx: [0, 0], bl: [], bk: [], body: '' },
+    { n: 3, t: 'Unrelated', st: 'OPEN', ms: 'Release', bx: [0, 0], bl: [], bk: [], body: '' },
+  ];
+  const raw = {
+    schemaVersion: 2, generated: true, capturedAt: '2030-01-01', requestedCount: 1,
+    ranked: [], gaps: [],
+    deps: [{ blocked: 1, blockedBy: [2, 3], why: 'Needs both.' }],
+  };
+
+  // Refusing one of two blockers leaves the other offerable — the card is half right.
+  const one = mutes.add(mutes.empty(), 'deps', mutes.depKey(1, 3), '#1 ⇠ #3').mutes;
+  const partial = hydratePlan(raw, milestones, issues, one);
+  assert.deepEqual(partial.deps[0].mutedBy, [3]);
+  assert.ok(!partial.deps[0].muted, 'a card is only muted when every edge on it is');
+  assert.deepEqual(partial.deps[0].blockedBy, [2, 3], 'the refusal is a mark, not a deletion');
+
+  const both = mutes.add(one, 'deps', mutes.depKey(1, 2), '#1 ⇠ #2').mutes;
+  assert.equal(hydratePlan(raw, milestones, issues, both).deps[0].muted, true);
+
+  assert.equal(mutes.count(both), 2);
+  assert.deepEqual(mutes.numbersFromKey('dep:1:2'), [1, 2]);
+  assert.equal(mutes.clear(both, 'deps').cleared, 2);
+});
+
+test('the plan prompt is told what the reader hid and refused', async (t) => {
+  const seen = [];
+  const { mock } = mockEndpoint(t, (req) => {
+    seen.push(req.body);
+    return { message: { content: JSON.stringify({ ranked: [], gaps: [], deps: [] }) } };
+  });
+  const endpoint = await listen(t, mock);
+  if (!endpoint) { t.skip('this environment does not permit loopback listeners'); return; }
+
+  await llm.planInsights({ endpoint, provider: 'ollama', model: 'test-model', timeoutMs: 5000 }, {
+    issues: [{ n: 7, t: 'Held back', st: 'OPEN', ms: null, bx: [0, 0], bl: [], bk: [], body: '' }],
+    milestones: [], labels: [], count: 5,
+    hiddenItems: [{ numbers: [7], label: 'Held back' }, { numbers: [], label: 'A proposal' }],
+    ignoredDeps: [{ blocked: 9, blockedBy: 4 }],
+  });
+
+  const sys = seen[0].messages[0].content;
+  assert.match(sys, /HIDDEN THESE ENTRIES/);
+  assert.match(sys, /#7 — Held back/);
+  assert.match(sys, /proposed issue "A proposal"/);
+  assert.match(sys, /#9 does NOT wait on #4/);
+  assert.match(sys, /Never propose any of these again/);
+
+  // Nothing is said when there is nothing to say — an empty heading is noise the model has
+  // to read on every single run.
+  assert.equal(llm.feedbackBlock({ hiddenItems: [], ignoredDeps: [] }), '');
+});
+
+test('a local model is kept resident and bounded, and repairs its own broken JSON', async (t) => {
+  let attempt = 0;
+  const { seen, mock } = mockEndpoint(t, () => {
+    attempt++;
+    // First answer is truncated mid-object, exactly as a model that ran out of room does.
+    const content = attempt === 1
+      ? '{"subject":"Tidy the parser","body":"Because'
+      : '{"subject":"Tidy the parser","body":"Because."}';
+    return { message: { content } };
+  });
+  const endpoint = await listen(t, mock);
+  if (!endpoint) { t.skip('this environment does not permit loopback listeners'); return; }
+
+  const cfg = {
+    endpoint, provider: 'ollama', model: 'test-model', timeoutMs: 5000,
+    numCtx: 16384, keepAliveMinutes: 30,
+  };
+  const summary = await llm.summarizeCommit(cfg, {
+    files: ['lib/x.js'], branch: 'main', truncated: false, patch: 'diff --git a/x b/x\n+1',
+  });
+  assert.equal(summary.subject, 'Tidy the parser', 'one repair turn rescues the whole run');
+  assert.equal(seen.length, 2, 'exactly one retry, not a loop');
+  const repair = seen[1].body.messages;
+  assert.match(repair[repair.length - 1].content, /not valid JSON/);
+  assert.match(repair[repair.length - 2].content, /Because$/, 'the model is shown its own truncated answer');
+
+  assert.equal(seen[0].body.keep_alive, '1800s', 'residency is asked for so the next call skips the load');
+  assert.equal(seen[0].body.options.num_predict, 8192, 'a runaway generation is capped, not left to fill the window');
+
+  // 0 means "whatever the server does by default", which has to be silence on the wire
+  // rather than keep_alive: 0 — that would unload the model immediately.
+  const { seen: quiet, mock: mock2 } = mockEndpoint(t, () => ({ message: { content: '{"subject":"x","body":""}' } }));
+  const endpoint2 = await listen(t, mock2);
+  if (!endpoint2) return;
+  await llm.summarizeCommit(Object.assign({}, cfg, { endpoint: endpoint2, keepAliveMinutes: 0 }), {
+    files: ['lib/x.js'], branch: 'main', truncated: false, patch: 'diff --git a/x b/x\n+1',
+  });
+  assert.ok(!('keep_alive' in quiet[0].body));
+  assert.equal(providers.keepAliveValue({ keepAliveMinutes: -1 }), -1, 'negative is "resident until unloaded"');
+});
+
+test('completed milestones leave the plan header, however they were completed', () => {
+  const { phaseComplete } = require('../lib/plans');
+  const milestones = [
+    { number: 1, title: 'Phase 1 — Done and closed', state: 'closed', dueOn: '2030-01-01', description: 'a' },
+    { number: 2, title: 'Phase 2 — Open but finished', state: 'open', dueOn: '2030-02-01', description: 'b' },
+    { number: 3, title: 'Phase 3 — In flight', state: 'open', dueOn: '2030-03-01', description: 'c' },
+    { number: 4, title: 'Phase 4 — Nothing filed yet', state: 'open', dueOn: '2030-04-01', description: 'd' },
+  ];
+  const phases = milestonePhases(milestones);
+  const issues = assignIssuePhases([
+    { n: 1, t: 'a', st: 'CLOSED', ms: 'Phase 1 — Done and closed', bx: [0, 0], bl: [], bk: [] },
+    { n: 2, t: 'b', st: 'CLOSED', ms: 'Phase 2 — Open but finished', bx: [0, 0], bl: [], bk: [] },
+    { n: 3, t: 'c', st: 'OPEN', ms: 'Phase 3 — In flight', bx: [0, 0], bl: [], bk: [] },
+  ], phases);
+
+  assert.equal(phaseComplete(phases[0], issues), true, 'closed on GitHub is complete');
+  assert.equal(phaseComplete(phases[1], issues), true,
+    'a milestone nobody closed but whose issues are all closed is complete too');
+  assert.equal(phaseComplete(phases[2], issues), false);
+  assert.equal(phaseComplete(phases[3], issues), false,
+    'an empty milestone is unfilled, not finished — hiding it would hide the work still to come');
+
+  // What the header actually shows: the first phase still ahead of you, not the first the
+  // repository ever had.
+  const next = phases.find(p => !phaseComplete(p, issues));
+  assert.equal(next.title, 'Phase 3 — In flight');
+});
+
+test('the assistant can read the dependency graph and honours refusals', () => {
+  const ctx = {
+    issuesLoaded: true,
+    issues: [
+      { n: 1, t: 'Foundation', st: 'OPEN', ms: null, l: [], a: [], bx: [0, 0], bl: [2], bk: [], body: '' },
+      { n: 2, t: 'Consumer', st: 'OPEN', ms: null, l: [], a: [], bx: [0, 0], bl: [], bk: [1], body: '' },
+      { n: 3, t: 'Free', st: 'OPEN', ms: null, l: [], a: [], bx: [0, 0], bl: [], bk: [], body: '' },
+    ],
+    milestones: [], labels: [],
+    rejectedDeps: [{ blocked: 3, blockedBy: 1 }],
+    ignoredTitles: ['Add a changelog'],
+  };
+
+  const graph = assistant.runTool('blocked_work', {}, ctx);
+  return graph.then((g) => {
+    assert.equal(g.readyCount, 2);
+    assert.ok(g.ready.some(r => r.startsWith('#1')));
+    assert.ok(g.ready.some(r => r.startsWith('#3')));
+    assert.equal(g.blocked.length, 1);
+    assert.match(g.blocked[0].issue, /^#2 /);
+    assert.match(g.blocked[0].waitingOn[0], /^#1 /);
+    assert.match(g.unblocks[0].issue, /^#1 /);
+
+    // A list row carries its edges, so ordering questions do not cost one get_issue each.
+    return assistant.runTool('list_issues', { state: 'open' }, ctx).then((rows) => {
+      assert.deepEqual(rows.issues.find(r => r.number === 2).blockedBy, [1]);
+      assert.equal(rows.issues.find(r => r.number === 3).blockedBy, undefined);
+
+      // An edge refused in the Plan view cannot be re-proposed through the conversation.
+      return assistant.runTool('propose_dependency', {
+        blocked: 3, blocked_by: [1], rationale: 'Looks related.',
+      }, ctx).then((refused) => {
+        assert.ok(refused.error, 'the refusal holds behind both doors');
+        assert.ok(refused.notes.some(n => /already rejected/.test(n)));
+
+        return assistant.runTool('propose_issue', {
+          title: 'Add a Changelog', body: 'x', rationale: 'y',
+        }, ctx).then((proposal) => {
+          assert.ok(proposal.proposal, 'an ignored idea is flagged, not blocked — the user may be asking for it');
+          assert.ok(proposal.proposal.notes.some(n => /previously ignored/.test(n)));
+        });
+      });
+    });
+  });
+});
+
+test('the assistant runs independent lookups in one round trip', async (t) => {
+  const order = [];
+  const { mock } = mockEndpoint(t, (req) => {
+    const turn = req.body.messages.filter(m => m.role === 'tool').length;
+    if (!turn) {
+      return { message: { content: '', tool_calls: [
+        { function: { name: 'get_issue', arguments: { number: 1 } } },
+        { function: { name: 'get_issue', arguments: { number: 2 } } },
+        { function: { name: 'blocked_work', arguments: {} } },
+      ] } };
+    }
+    order.push(turn);
+    return { message: { content: 'Start #1; #2 waits on it.' } };
+  });
+  const endpoint = await listen(t, mock);
+  if (!endpoint) { t.skip('this environment does not permit loopback listeners'); return; }
+
+  const out = await assistant.chat({ endpoint, provider: 'ollama', model: 'test-model', timeoutMs: 5000 }, {
+    ctx: {
+      issuesLoaded: true, milestones: [], labels: [],
+      issues: [
+        { n: 1, t: 'Foundation', st: 'OPEN', ms: null, l: [], a: [], bx: [0, 0], bl: [2], bk: [], body: '' },
+        { n: 2, t: 'Consumer', st: 'OPEN', ms: null, l: [], a: [], bx: [0, 0], bl: [], bk: [1], body: '' },
+      ],
+    },
+    messages: [{ role: 'user', content: 'What should I start?' }],
+  });
+
+  assert.equal(out.steps, 2, 'three lookups cost one turn, not three');
+  assert.deepEqual(out.trace.map(x => x.tool), ['get_issue', 'get_issue', 'blocked_work'],
+    'results are appended in call order, which is how every provider matches them to their calls');
+  assert.equal(order.length, 1);
+});
