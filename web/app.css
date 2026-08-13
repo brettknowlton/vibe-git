@@ -392,6 +392,21 @@ pre{margin:0; background:var(--raise); border:1px solid var(--line); border-radi
   max-height:340px; overflow-y:auto;
 }
 
+/* ── the comment thread on an issue ──────────────────────────────── */
+/* Each comment is a body-md with a byline, so a long argument scrolls inside its own box
+   rather than pushing the editors below it off the page. The thread as a whole scrolls too:
+   twenty comments of four thousand characters is taller than any screen. */
+.comments{display:flex; flex-direction:column; gap:8px; max-height:520px; overflow-y:auto}
+.cmt{display:flex; flex-direction:column; gap:4px}
+.cmt-h{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+.cmt-h .who{font-size:12px; font-weight:600; color:var(--fg)}
+.cmt-h a{text-decoration:none}
+.cmt-h a:hover{color:var(--fg)}
+.cmt .body-md{max-height:260px}
+/* A staged comment is a draft, not part of the conversation — nobody else can see it yet. */
+.cmt.pending{margin-top:8px}
+.cmt.pending .body-md{border-style:dashed; background:var(--surface2)}
+
 /* ═══ changes / history ════════════════════════════════════════════ */
 .filelist{display:flex; flex-direction:column}
 .frow{display:flex; align-items:center; gap:9px; padding:7px 12px; border-bottom:1px solid var(--line-soft); cursor:pointer}
@@ -631,6 +646,19 @@ pre{margin:0; background:var(--raise); border:1px solid var(--line); border-radi
 .crow .sha{font-family:var(--mono); font-size:11.5px; color:var(--fg-dim)}
 .crow .s{font-size:13px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .crow .w{font-family:var(--mono); font-size:10.5px; color:var(--fg-dim); white-space:nowrap}
+/* ── issue activity, sharing the commit-row grid ─────────────────── */
+/* The date header is a row, not a heading above the box, so the three columns stay aligned
+   down the whole list rather than restarting under every day. */
+.crow.dayhead{background:var(--surface2); cursor:default}
+.crow.dayhead .s{font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--fg-dim)}
+.crow.ev-opened .sha{color:var(--ok)}
+.crow.ev-closed .sha{color:var(--fg-dim)}
+.crow.ev-commented .sha{color:var(--fill)}
+.crow.ev-opened:hover,.crow.ev-closed:hover,.crow.ev-commented:hover{background:var(--surface2)}
+/* An issue list old enough that acting on it is a guess. The colour is the message. */
+#stamp.stale{color:var(--warn); font-weight:600}
+/* "Worth a look" — assigned to you, or somebody replied after you did. */
+.why-chip.mine{color:var(--fill); font-weight:700}
 
 /* ═══ staged changes ═══════════════════════════════════════════════ */
 .staged{display:flex; flex-direction:column; gap:9px}

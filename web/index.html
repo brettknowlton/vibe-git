@@ -42,15 +42,29 @@
 
   <div class="main">
     <aside class="side">
+      <!--
+        Each entry says what QUESTION its view answers and, where it matters, which half of
+        the app it belongs to. The split is the thing a one-word label cannot carry: Changes,
+        Conflicts and History are local Git and act immediately; Issues, Plan, Pull requests
+        and Staged are GitHub and act only when you push. Reading "Changes" and "Staged" as
+        the same kind of pending is the mistake the labels invite.
+      -->
       <nav class="nav" id="nav">
-        <button data-view="issues"  aria-current="true">Issues        <span class="count" id="c-issues">—</span></button>
-        <button data-view="plan"    aria-current="false">Plan          <span class="count" id="c-plan">—</span></button>
-        <button data-view="changes" aria-current="false">Changes       <span class="count" id="c-changes">—</span></button>
+        <button data-view="issues"  aria-current="true"
+                title="Every issue in the tracker, open and closed. Filter by state, milestone, label, assignee, or what is ready to start now. Editing anything here stages a change — nothing reaches GitHub until you push it.">Issues        <span class="count" id="c-issues">—</span></button>
+        <button data-view="plan"    aria-current="false"
+                title="What to work on next, and why: open issues ranked from milestone order, due dates, checklist progress and what blocks what. Generate one from the Assistant's Run tab — until then this is disabled.">Plan          <span class="count" id="c-plan">—</span></button>
+        <button data-view="changes" aria-current="false"
+                title="Uncommitted work in your working tree, file by file, with stashes and the commit box. This is local Git, not GitHub: committing here changes nothing on the remote until you push the branch.">Changes       <span class="count" id="c-changes">—</span></button>
         <!-- Only present while a merge is half-finished; renderNav() shows and hides it. -->
-        <button data-view="conflicts" id="nav-conflicts" aria-current="false" hidden>Conflicts     <span class="count" id="c-conflicts">0</span></button>
-        <button data-view="history" aria-current="false">History       <span class="count" id="c-history">—</span></button>
-        <button data-view="prs"     aria-current="false">Pull requests <span class="count" id="c-prs">—</span></button>
-        <button data-view="staged"  aria-current="false">Staged        <span class="count" id="c-staged">0</span></button>
+        <button data-view="conflicts" id="nav-conflicts" aria-current="false" hidden
+                title="Appears only while a merge or rebase is half-finished. Names both sides of every conflict — which branch each came from and which is newer — and says so loudly when a rebase has swapped them.">Conflicts     <span class="count" id="c-conflicts">0</span></button>
+        <button data-view="history" aria-current="false"
+                title="Commits on the current branch, newest first. Click one to read its message and the full diff it introduced.">History       <span class="count" id="c-history">—</span></button>
+        <button data-view="prs"     aria-current="false"
+                title="Pull requests on this repository — open, merged or closed — and a form to raise a new one from the current branch with an editable description.">Pull requests <span class="count" id="c-prs">—</span></button>
+        <button data-view="staged"  aria-current="false"
+                title="Issue changes waiting to be pushed: edits, comments, closes, reopens and new issues. Review, alter or drop any of them here. This is the only place issue changes leave for GitHub.">Staged        <span class="count" id="c-staged">0</span></button>
       </nav>
       <div class="side-body" id="side-body"></div>
       <div class="side-foot" id="side-foot"></div>
@@ -64,9 +78,15 @@
     <aside class="rail" id="ai-panel" hidden aria-label="Assistant">
       <div class="rail-head">
         <div class="rail-tabs" role="tablist">
-          <button id="ai-tab-run" role="tab" aria-selected="true">Run</button>
-          <button id="ai-tab-chat" role="tab" aria-selected="false">Chat</button>
-          <button id="ai-tab-set" role="tab" aria-selected="false">Settings</button>
+          <!-- What each tab is FOR, not what it is called. The three do different kinds of
+               work — batch jobs, conversation, configuration — and the one-word labels that
+               fit the rail do not say which is which. -->
+          <button id="ai-tab-run" role="tab" aria-selected="true"
+                  title="One-shot jobs over the whole tracker: classify, suggest, plan, find duplicates. Everything they produce is a proposal you stage yourself.">Run</button>
+          <button id="ai-tab-chat" role="tab" aria-selected="false"
+                  title="Ask about this repository in your own words. It can read the issues, the plan, the commits and the source, and propose changes — it can never write to GitHub.">Chat</button>
+          <button id="ai-tab-set" role="tab" aria-selected="false"
+                  title="Which model, which endpoint, and how much of it to use. Keys are stored locally and never reach this page.">Settings</button>
         </div>
         <span class="rail-state" id="ai-state"></span>
         <button class="btn sm" id="ai-close" title="Collapse">✕</button>

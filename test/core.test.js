@@ -416,6 +416,60 @@ test('the front-end and the server agree on the API version', () => {
   assert.match(server, /api: API_VERSION/, 'the version must reach the page in the boot payload');
 });
 
+/*
+ * Every navigable surface explains itself on hover.
+ *
+ * The labels are one word because the sidebar is narrow, and one word cannot carry the
+ * distinction the app actually runs on: Changes/Conflicts/History are local Git and act
+ * immediately, Issues/Plan/Staged are GitHub and act only on push. Somebody reading
+ * "Changes 3" and "Staged 3" has no way to know those are different kinds of pending.
+ */
+test('every nav entry and assistant tab says what it is for', () => {
+  const html = fs.readFileSync(path.join(ROOT, 'web', 'index.html'), 'utf8');
+  const nav = /<nav class="nav" id="nav">([\s\S]*?)<\/nav>/.exec(html);
+  assert.ok(nav, 'index.html must hold the nav');
+  const buttons = nav[1].match(/<button[\s\S]*?>/g) || [];
+  assert.equal(buttons.length, 7, 'seven views: issues, plan, changes, conflicts, history, prs, staged');
+  for (const b of buttons) {
+    const view = (/data-view="([a-z]+)"/.exec(b) || [])[1];
+    const title = (/title="([^"]+)"/.exec(b) || [])[1] || '';
+    // Long enough to be an explanation rather than a restatement of the label.
+    assert.ok(title.length > 60, `the ${view} tab needs a tooltip that explains what it does`);
+  }
+  for (const id of ['ai-tab-run', 'ai-tab-chat', 'ai-tab-set']) {
+    const tab = new RegExp('<button id="' + id + '"[\\s\\S]*?>').exec(html);
+    assert.ok(tab, id + ' not found');
+    assert.match(tab[0], /title="[^"]{60,}"/, id + ' needs a tooltip');
+  }
+});
+
+/*
+ * A repository has two histories: what the code did and what the tracker did. The commit log
+ * cannot show a decision taken in an issue thread and never written into a commit message,
+ * which is most of them.
+ */
+test('the History view can read the tracker as well as the commit log', () => {
+  const app = fs.readFileSync(path.join(ROOT, 'web', 'app.js'), 'utf8');
+  assert.match(app, /function issueEvents\(/);
+  assert.match(app, /function setHistoryMode\(/);
+  // A commit selected under one reading is meaningless under the other.
+  assert.match(/function setHistoryMode\([\s\S]*?\n}/.exec(app)[0], /SEL\.commit = null/,
+    'switching readings must drop a selection the other one cannot render');
+
+  // The timeline is only as honest as the fields a pull actually stores.
+  const fields = /const FIELDS = '([^']+)'/.exec(fs.readFileSync(path.join(ROOT, 'lib', 'issues.js'), 'utf8'));
+  assert.ok(fields, 'lib/issues.js must declare FIELDS');
+  for (const f of ['createdAt', 'closedAt', 'comments']) {
+    assert.ok(fields[1].split(',').includes(f), `the issue pull must fetch ${f} for the timeline`);
+  }
+  /*
+   * Label changes, reassignments and reopens are real events that live only in GitHub's
+   * timeline API, which a pull does not fetch. Deriving them from `updatedAt` would produce
+   * a history that looks complete and is wrong, so the view says what it cannot show.
+   */
+  assert.match(app, /Label changes and reassignments are not here/);
+});
+
 test('remote access requires a proxied request from an allowed tailnet identity', () => {
   const { createAccess } = require('../lib/access');
   const access = createAccess({
@@ -709,8 +763,15 @@ test('plan prompts spend their budget on open issues, not finished ones', async 
   // Every open issue survives to the model; that is what a 30-entry plan needs to exist.
   for (const n of [1, 35, 70]) assert.match(user, new RegExp('#' + n + ' \\(Release\\)'));
   // Closed issues are present as titles and cost no body at all.
-  assert.match(user, /#200 Finished work 200/);
+  assert.match(user, /- Finished work 200/);
   assert.doesNotMatch(user, /Finished work 200\n\s+x{20}/);
+  /*
+   * ...and WITHOUT their numbers, which is what stops them being proposed as blockers. The
+   * model is told a closed issue blocks nothing; withholding the numbers is what makes that
+   * instruction unnecessary. Recognising finished work is a title-matching job, so nothing
+   * downstream loses anything.
+   */
+  for (const n of [200, 230, 260]) assert.doesNotMatch(user, new RegExp('#' + n + '\\b'));
   // And the whole thing still fits the configured window rather than overrunning it.
   assert.ok(user.length < 16384 * 3.5, 'prompt should stay inside the context window');
 });
@@ -1995,6 +2056,107 @@ test('proposed dependency edges are validated against the live tracker', () => {
   assert.equal(deps.length, 1);
 });
 
+/*
+ * Dropping these silently was the actual complaint behind "stop proposing closed issues".
+ *
+ * Validation has always thrown the edges away, so nothing wrong was ever recorded — but a run
+ * that proposed six and kept two looked identical to a run that only found two, and the
+ * discarded four surfaced only as dangling numbers left behind in the surviving rationale.
+ */
+test('dependency edges dropped for naming finished work are counted, not swallowed', () => {
+  const server = fs.readFileSync(path.join(ROOT, 'server.js'), 'utf8');
+  const closedDrops = /const closedDepDrops = [\s\S]{0,400}?;\n/.exec(server);
+  assert.ok(closedDrops, 'server.js must define closedDepDrops');
+  // It must count exactly the reason normalizeDeps writes, or it silently counts zero forever.
+  const { rejected } = searchOps.normalizeDeps(
+    [{ blocked: 1, blockedBy: [2, 3], why: 'both finished' }],
+    {
+      issues: [
+        { n: 1, t: 'Open', st: 'OPEN', bk: [] },
+        { n: 2, t: 'Done', st: 'CLOSED', bk: [] },
+        { n: 3, t: 'Also done', st: 'CLOSED', bk: [] },
+      ],
+    });
+  const matcher = / is closed$/;
+  assert.equal(rejected.filter(r => matcher.test(r.reason)).length, 2);
+  assert.match(server, /depsClosed/, 'the count has to reach the browser to be worth having');
+});
+
+/*
+ * The prompt-side half of the same problem. Validation catches a closed blocker; it cannot
+ * stop the model spending a proposal on one, and the plan prompt used to hand it a list of
+ * closed issue NUMBERS for gap-deduplication and then ask it not to use them.
+ */
+test('nothing tells the model a closed issue can block something', () => {
+  const llmSrc = fs.readFileSync(path.join(ROOT, 'lib', 'llm.js'), 'utf8');
+  const assistantSrc = fs.readFileSync(path.join(ROOT, 'lib', 'assistant.js'), 'utf8');
+  assert.match(llmSrc, /A CLOSED issue is finished work and blocks NOTHING/);
+  assert.match(llmSrc, /deliberately without their numbers/);
+  // The closed block is built from titles alone — no `#${i.n}` interpolation anywhere in it.
+  const closedBlock = /const closedBlock = [\s\S]{0,500}?: '';/.exec(llmSrc);
+  assert.ok(closedBlock, 'llm.js must build a closed-issue block');
+  assert.doesNotMatch(closedBlock[0], /#\$\{i\.n\}/,
+    'a closed number in the prompt is one the model will eventually use as a blocker');
+  assert.match(assistantSrc, /A CLOSED issue blocks nothing/);
+  assert.match(assistantSrc, /BOTH issues must be OPEN/);
+  /*
+   * Withholding the closed numbers is necessary and not sufficient, which is the part that
+   * took measuring to see. Open issue bodies carry closed numbers into the open list — this
+   * tracker's #152 says "#102" and #102 shipped — so "only numbers from the OPEN ISSUES
+   * list" reads as permission when the number is sitting right there inside it. The rule has
+   * to name the LINE, not the list.
+   */
+  assert.match(llmSrc, /BEGINS an entry in the OPEN ISSUES list, on its own line/);
+  assert.match(llmSrc, /Numbers written inside an issue body are references, not candidates/);
+  assert.match(llmSrc, /The numbers in an issue body are REFERENCES, not blockers/);
+});
+
+/*
+ * Server-side validation runs when a proposal is made and again when the plan is read back,
+ * and neither helps the copy already sitting in the page: DEP_PROPOSALS and S.insights
+ * survive a pull, so an edge stays offerable after the pull that closed its blocker.
+ */
+test('the page re-checks a proposed dependency against the issue list it has now', () => {
+  const app = fs.readFileSync(path.join(ROOT, 'web', 'app.js'), 'utf8');
+  assert.match(app, /function depOpen\(n\)/, 'the page needs its own liveness test');
+  // Every place that can offer an edge has to use it: the card, the stage action, and the
+  // count in the section heading, or they disagree about what is left to do.
+  for (const fn of ['function depCard(', 'async function stageDependency(', 'function planDepProposals(']) {
+    const from = app.indexOf(fn);
+    assert.ok(from >= 0, fn + ' not found');
+    const to = app.indexOf('\n}\n', from);
+    assert.ok(to > from, fn + ' has no closing brace at column zero');
+    assert.match(app.slice(from, to), /depOpen\(/,
+      fn + ' must re-check blocker state before offering an edge');
+  }
+});
+
+/*
+ * Comment bodies were fetched on every pull and thrown away except for their length, so an
+ * issue whose thread reversed its body read as current. Both caps exist because the cache is
+ * one file per repository read whole on every request.
+ */
+test('an issue keeps its discussion, newest first to be dropped last', () => {
+  const many = Array.from({ length: 30 }, (_, k) => ({
+    author: { login: 'someone' }, createdAt: '2026-01-01T00:00:00Z',
+    url: 'https://example.invalid/#' + k, body: 'comment ' + k,
+  }));
+  const kept = issueOps.comments(many);
+  assert.equal(kept.count, 30, 'the true total survives the trim');
+  assert.equal(kept.kept.length, issueOps.COMMENT_LIMIT);
+  // The trim takes from the front: what was said most recently is what is worth keeping.
+  assert.equal(kept.kept[kept.kept.length - 1].body, 'comment 29');
+  assert.equal(kept.kept[0].body, 'comment 10');
+
+  const huge = issueOps.comments([{ author: null, body: 'y'.repeat(9000), createdAt: null, url: null }]);
+  assert.equal(huge.kept[0].body.length, issueOps.COMMENT_CHARS);
+  assert.equal(huge.kept[0].who, null, 'a deleted account is not a crash');
+
+  // gh returns a count rather than an array on some shapes; that must not become a fake thread.
+  assert.deepEqual(issueOps.comments(4), { count: 4, kept: [] });
+  assert.deepEqual(issueOps.comments(undefined), { count: 0, kept: [] });
+});
+
 test('the assistant proposes a dependency as a body edit it can never apply', async () => {
   const ctx = {
     issues: [
@@ -2335,4 +2497,216 @@ test('the assistant runs independent lookups in one round trip', async (t) => {
   assert.deepEqual(out.trace.map(x => x.tool), ['get_issue', 'get_issue', 'blocked_work'],
     'results are appended in call order, which is how every provider matches them to their calls');
   assert.equal(order.length, 1);
+});
+
+/* ═══ templates, catch-up, milestone editing ═══════════════════════ */
+
+const tmpl = require('../lib/templates');
+
+/*
+ * A maintainer writes an issue template to ask specific questions, and until now filing
+ * through this app skipped every one of them. That made vibe-git strictly worse than
+ * github.com for any repository that defines templates — the one comparison it cannot lose.
+ */
+test('a repository lends the app its own issue and pull request templates', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-git-tmpl-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const where = path.join(dir, '.github', 'ISSUE_TEMPLATE');
+  fs.mkdirSync(where, { recursive: true });
+
+  fs.writeFileSync(path.join(where, 'bug.md'),
+    '---\nname: Bug report\nabout: Something broke\ntitle: "[Bug] "\nlabels: bug, needs triage\n---\n\n**What happened**\n');
+  fs.writeFileSync(path.join(where, 'feature.yml'), [
+    'name: Feature request',
+    'description: Suggest an idea',
+    'title: "[Feature]: "',
+    'labels: ["enhancement"]',
+    'body:',
+    '  - type: markdown',
+    '    attributes:',
+    '      value: |',
+    '        Thanks!',
+    '  - type: textarea',
+    '    id: problem',
+    '    attributes:',
+    '      label: What problem does this solve?',
+    '      description: Be concrete.',
+    '    validations:',
+    '      required: true',
+    '  - type: checkboxes',
+    '    id: terms',
+    '    attributes:',
+    '      label: Code of Conduct',
+    '      options:',
+    '        - label: I agree',
+    '',
+  ].join('\n'));
+  // Not a template: it configures the chooser itself and must never be offered as one.
+  fs.writeFileSync(path.join(where, 'config.yml'), 'blank_issues_enabled: false\n');
+  fs.writeFileSync(path.join(dir, '.github', 'PULL_REQUEST_TEMPLATE.md'), '## What changed\n\n- [ ] Tests pass\n');
+
+  const found = tmpl.forRepo(dir);
+  assert.deepEqual(found.issue.map(x => x.name), ['Bug report', 'Feature request']);
+  assert.equal(found.pr.length, 1);
+
+  const [bug, feature] = found.issue;
+  assert.deepEqual(bug.labels, ['bug', 'needs triage']);
+  assert.equal(bug.title, '[Bug] ');
+  assert.match(bug.body, /^\*\*What happened\*\*/, 'front matter is metadata, not body');
+
+  // An issue form has no widgets here, so its questions become a skeleton somebody can type
+  // into — the same fallback GitHub uses when a form is filed through the API.
+  assert.deepEqual(feature.labels, ['enhancement']);
+  assert.match(feature.body, /### What problem does this solve\? \*\(required\)\*/);
+  assert.match(feature.body, /<!-- Be concrete\. -->/);
+  assert.match(feature.body, /- \[ \] I agree/);
+  assert.match(feature.body, /^Thanks!/, 'a markdown block is prose, not a question');
+});
+
+/*
+ * A repository is untrusted content, and this app will clone one from a URL on request.
+ *
+ * A symlink at `.github/PULL_REQUEST_TEMPLATE.md` pointing outside the working tree was read
+ * and prefilled into the pull request description, where a two-stage confirm was the only
+ * thing between it and a public GitHub comment. Both guards are tested because either alone
+ * has a hole: lstat catches a symlinked file, containment catches a symlinked directory.
+ */
+test('a template symlinked outside the repository is refused', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-git-sym-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const repo = path.join(dir, 'repo');
+  fs.mkdirSync(path.join(repo, '.github', 'ISSUE_TEMPLATE'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'secret.txt'), 'PRIVATE KEY MATERIAL');
+
+  // The fixed-name reads are the ones that took a path rather than a directory entry.
+  fs.symlinkSync(path.join(dir, 'secret.txt'), path.join(repo, '.github', 'PULL_REQUEST_TEMPLATE.md'));
+  fs.symlinkSync(path.join(dir, 'secret.txt'), path.join(repo, '.github', 'ISSUE_TEMPLATE.md'));
+  fs.symlinkSync(path.join(dir, 'secret.txt'), path.join(repo, '.github', 'ISSUE_TEMPLATE', 'sneaky.md'));
+
+  const found = tmpl.forRepo(repo);
+  const all = JSON.stringify(found);
+  assert.doesNotMatch(all, /PRIVATE KEY MATERIAL/, 'no file outside the repository may be read');
+  assert.deepEqual(found.issue, []);
+  assert.deepEqual(found.pr, []);
+
+  // A symlink that stays INSIDE the repository is legitimate and must still work.
+  fs.writeFileSync(path.join(repo, 'real-template.md'), 'inside the repo\n');
+  fs.symlinkSync(path.join(repo, 'real-template.md'), path.join(repo, 'docs-link.md'));
+  fs.mkdirSync(path.join(repo, 'docs'), { recursive: true });
+  fs.symlinkSync(path.join(repo, 'real-template.md'), path.join(repo, 'docs', 'PULL_REQUEST_TEMPLATE.md'));
+  assert.match(JSON.stringify(tmpl.forRepo(repo)), /inside the repo/);
+});
+
+test('a repository with no templates is not an error', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vibe-git-notmpl-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  assert.deepEqual(tmpl.forRepo(dir), { issue: [], pr: [] });
+  assert.deepEqual(tmpl.forRepo(path.join(dir, 'does-not-exist')), { issue: [], pr: [] });
+});
+
+/*
+ * The tracker moves whether or not you are looking at it, and nothing used to say so.
+ * Your own actions are excluded throughout: being told about the issue you closed two
+ * minutes ago is noise, and noise is how a surface like this gets ignored permanently.
+ */
+test('the catch-up digest reports what OTHER people did, and only since you looked', () => {
+  const seenOps = require('../lib/seen');
+  const issues = [
+    { n: 1, st: 'OPEN', a: ['me'], createdAt: '2026-08-10T00:00:00Z', closedAt: null, cm: [] },
+    { n: 2, st: 'CLOSED', a: [], createdAt: '2026-08-01T00:00:00Z', closedAt: '2026-08-11T00:00:00Z', cm: [] },
+    { n: 3, st: 'OPEN', a: ['me'], createdAt: '2026-08-01T00:00:00Z', closedAt: null,
+      cm: [{ who: 'them', at: '2026-08-12T00:00:00Z' }] },
+    { n: 4, st: 'OPEN', a: [], createdAt: '2026-08-01T00:00:00Z', closedAt: null,
+      cm: [{ who: 'me', at: '2026-08-12T00:00:00Z' }] },
+    { n: 5, st: 'OPEN', a: [], createdAt: '2026-07-01T00:00:00Z', closedAt: null, cm: [] },
+  ];
+  const d = seenOps.digest(issues, '2026-08-05T00:00:00Z', 'me');
+  assert.deepEqual(d.filed, [1], 'filed before you looked is not news');
+  assert.deepEqual(d.closed, [2]);
+  assert.deepEqual(d.commented, [3], 'your own comment is not something to report to you');
+  assert.deepEqual(d.mine, [3], 'a reply on an issue assigned to you is the part worth interrupting for');
+  assert.equal(d.total, 3);
+
+  /*
+   * Never marked means show nothing — NOT show everything. Opening a 600-issue tracker for
+   * the first time and being told all 600 events are unread is not news, it is a wall.
+   */
+  const first = seenOps.digest(issues, null, 'me');
+  assert.equal(first.total, 0);
+  assert.deepEqual(first.filed, []);
+});
+
+/*
+ * Titles, descriptions and due dates drive the entire Plan view. Being able to create a
+ * milestone but never correct one left every one of those inputs editable only on github.com.
+ */
+test('a milestone can be corrected, and clearing a due date is not the same as leaving it', () => {
+  const { KINDS } = require('../lib/queue');
+  const ctx = { milestones: [{ number: 3, title: 'Phase 2', state: 'open' }, { number: 4, title: 'Phase 3' }] };
+  const k = KINDS.milestoneEdit;
+
+  const renamed = k.validate({ number: 3, title: 'Phase 2 — Supply', dueOn: '2026-09-01' }, ctx);
+  assert.match(k.describe(renamed), /Milestone “Phase 2”: rename to “Phase 2 — Supply”, due 2026-09-01/);
+  assert.deepEqual(k.argv(renamed).slice(0, 4),
+    ['api', '--method', 'PATCH', 'repos/:owner/:repo/milestones/3']);
+
+  // -F, not -f: a null has to reach the API as JSON null rather than the string "null",
+  // which is the difference between clearing the date and setting it to something unparseable.
+  const cleared = k.validate({ number: 3, dueOn: null }, ctx);
+  assert.ok(k.argv(cleared).includes('-F'));
+  assert.ok(k.argv(cleared).includes('due_on=null'));
+  assert.match(k.describe(cleared), /clear the due date/);
+
+  // An omitted key means "unchanged" and must not be confused with "clear it".
+  assert.ok(!Object.prototype.hasOwnProperty.call(k.validate({ number: 3, state: 'closed' }, ctx), 'dueOn'));
+
+  assert.throws(() => k.validate({ number: 3 }, ctx), /changes nothing/);
+  assert.throws(() => k.validate({ number: 3, dueOn: '1st Sept' }, ctx), /YYYY-MM-DD/);
+  assert.throws(() => k.validate({ number: 3, title: 'Phase 3' }, ctx), /already called/);
+  assert.throws(() => k.validate({ number: 3, state: 'archived' }, ctx), /"open" or "closed"/);
+});
+
+/*
+ * A rename has to be applied before the issue edits that reference the milestone BY TITLE,
+ * or those edits name something that no longer exists.
+ */
+test('milestone renames are applied before the issue changes that name them', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'queue.js'), 'utf8');
+  const first = /const first = \(c\) =>[^;]+;/.exec(src);
+  assert.ok(first, 'push() must order prerequisites first');
+  for (const kind of ['milestone', 'label', 'milestoneEdit']) {
+    assert.ok(first[0].includes(`'${kind}'`), `${kind} must be applied before dependent issue changes`);
+  }
+});
+
+/*
+ * Three different problems with three different fixes that all used to arrive identically:
+ * as whatever stderr said, in a toast, halfway through an action already committed to.
+ */
+test('a missing or outdated gh is reported as itself, not as a broken app', async () => {
+  const issueOps = require('../lib/issues');
+  assert.deepEqual(issueOps.MIN_GH, [2, 54, 0], 'the floor the README states');
+  const h = await issueOps.health(path.join(ROOT, 'no-such-directory-anywhere'));
+  assert.equal(typeof h.installed, 'boolean');
+  if (h.installed && h.current) assert.equal(h.problem, null, 'a working install must say nothing');
+  if (!h.installed) assert.match(h.fix, /cli\.github\.com/);
+});
+
+/*
+ * The form used to build fresh inputs every render and hold the text nowhere else, so any
+ * redraw — a filter click, a background refresh, a push landing — silently emptied a
+ * half-written issue. The chat box has had a draft variable for this since it was written.
+ */
+test('a half-written issue survives a redraw', () => {
+  const app = fs.readFileSync(path.join(ROOT, 'web', 'app.js'), 'utf8');
+  assert.match(app, /let issueDraft = null/);
+  const form = /function paneNewIssue\([\s\S]*?\n}\n/.exec(app);
+  assert.ok(form, 'paneNewIssue not found');
+  assert.match(form[0], /issueDraft/, 'the form must read and write the draft, not local state');
+  for (const field of ['title', 'body', 'ms']) {
+    assert.match(form[0], new RegExp(field + "\\.addEventListener\\('(input|change)'"),
+      `${field} must record every keystroke — the point is surviving a redraw nobody asked for`);
+  }
+  // Cleared exactly where the user has said they are finished with it, and nowhere else.
+  assert.equal((form[0].match(/issueDraft = null/g) || []).length, 2, 'cleared on stage and on cancel');
 });

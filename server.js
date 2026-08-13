@@ -47,6 +47,8 @@ const assistant = require('./lib/assistant');
 const { Jobs, isCancel, CancelError } = require('./lib/jobs');
 const { createAccess, AccessError } = require('./lib/access');
 const search = require('./lib/search');
+const templates = require('./lib/templates');
+const seen = require('./lib/seen');
 const workspace = require('./lib/workspace');
 
 const HERE = __dirname;
@@ -65,7 +67,7 @@ const CSP_NONCE = crypto.randomBytes(18).toString('base64');
  *
  * BUMP IT whenever you add, remove or rename a route.
  */
-const API_VERSION = 7;
+const API_VERSION = 9;
 
 // Repository slugs become local cache filenames. Replace every separator and collapse
 // dot-dot so even a malformed hand-edited remote cannot escape the intended directory.
@@ -236,6 +238,7 @@ function slugFor(dir) {
 
 const metaCache = new Map();
 let AUTH = null;
+let GH_HEALTH = null;
 async function metaFor(dir, { fresh = false } = {}) {
   if (!fresh && metaCache.has(dir)) return metaCache.get(dir);
   // Milestones and labels are what colour and group the whole UI, so a restart should not
@@ -403,6 +406,18 @@ function dropRefusedDeps(deps, refused) {
     return keep.length ? Object.assign({}, dep, { blockedBy: keep }) : null;
   }).filter(Boolean);
 }
+
+/*
+ * How many proposed edges were thrown away for naming finished work.
+ *
+ * normalizeDeps has always dropped these, and until now the only trace was a console line
+ * the user never sees — so a run that proposed six dependencies and kept two looked exactly
+ * like a run that found two. Saying it out loud is the difference between "the model found
+ * little here" and "the model is reaching for issues that are already closed", which are
+ * opposite conclusions about whether the tracker is worth asking again.
+ */
+const closedDepDrops = (rejected) =>
+  (rejected || []).filter(r => / is closed$/.test(String(r && r.reason || ''))).length;
 
 const textHash = (t) => crypto.createHash('sha1').update(t).digest('hex').slice(0, 16);
 
@@ -589,6 +604,9 @@ async function buildState({ fresh = false } = {}) {
 
   // Who gh is authenticated as. Cached: `gh auth status` is ~350ms and rarely changes.
   if (!AUTH || fresh) AUTH = await issueOps.authStatus(dir);
+  // Whether gh is there at all, and new enough. Cached alongside for the same reason, and
+  // separate from AUTH because "not installed" and "not signed in" need different sentences.
+  if (!GH_HEALTH || fresh) GH_HEALTH = await issueOps.health(dir).catch(() => null);
 
   // Issues come from cache only. `issuesLoaded: false` tells the UI to pull them once.
   const cache = cachedIssues(dir);
@@ -610,6 +628,14 @@ async function buildState({ fresh = false } = {}) {
     issuesStored: !!(cache && cache.stored),
     queue: queue.for(dir),
     auth: AUTH,
+    ghHealth: GH_HEALTH,
+    /*
+     * What has happened in the tracker since you last acknowledged it, and when that was.
+     * Computed rather than stored, from timestamps the pull already keeps — so it cannot
+     * drift out of step with the issues it describes, and marking it read is one write.
+     */
+    seenAt: seen.seenAt(sel.github || sel.name),
+    digest: seen.digest(issues, seen.seenAt(sel.github || sel.name), github && github.login),
     branchPr,
     insights: insightsFor(sel.github, (github && github.milestones) || [], issues),
     planStatus: planStatus(sel.github || sel.name, issues),
@@ -714,9 +740,22 @@ const routes = {
     if (!repos.selected.github) throw new HttpError(400, 'This repository has no GitHub remote');
     const t0 = Date.now();
     const c = await pullIssues(dir);
+    const slug = repos.selected.github;
+    /*
+     * The first sight of a tracker is the baseline, not a backlog.
+     *
+     * Without this, "since you last caught up" has no `since` and stays silent forever until
+     * somebody presses a button explaining itself. With it, opening a 600-issue repository
+     * reports nothing — correctly, because none of it happened while you were away — and
+     * every pull after this one has something real to compare against.
+     */
+    if (!seen.seenAt(slug)) seen.markSeen(slug, c.at || new Date().toISOString());
+    const m = await metaFor(dir);
     return {
       ok: true, issues: c.issues, truncated: c.truncated, issuesAt: c.at, issuesLoaded: true, issuesStored: false,
-      insights: insightsFor(repos.selected.github, (await metaFor(dir)).milestones, c.issues),
+      insights: insightsFor(slug, m.milestones, c.issues),
+      seenAt: seen.seenAt(slug),
+      digest: seen.digest(c.issues, seen.seenAt(slug), m.login),
       message: `Pulled ${c.issues.length} issues in ${((Date.now() - t0) / 1000).toFixed(1)}s`,
     };
   }),
@@ -1085,6 +1124,33 @@ const routes = {
 
   'GET /api/auth': async () => { AUTH = await issueOps.authStatus(repos.selected && repos.selected.path); return AUTH; },
 
+  /*
+   * Templates the repository itself defines. Read from the working tree on request rather
+   * than folded into the state payload: they change when you switch branch or pull, most
+   * repositories have none, and the New Issue form is the only thing that wants them.
+   */
+  'GET /api/templates': async () => withRepo((dir) => {
+    const found = templates.forRepo(dir);
+    return Object.assign({ ok: true }, found, {
+      message: found.issue.length || found.pr.length
+        ? `${found.issue.length} issue and ${found.pr.length} pull request template${found.pr.length === 1 ? '' : 's'}`
+        : 'This repository defines no templates',
+    });
+  }),
+
+  /* "I have read this." One timestamp, so it cannot disagree with the issues it describes. */
+  'POST /api/issues/seen': async (_q, body) => withRepo(async (dir) => {
+    const slug = repos.selected.github || repos.selected.name;
+    const at = seen.markSeen(slug, body && body.at);
+    const cache = cachedIssues(dir);
+    const m = await metaFor(dir).catch(() => null);
+    return {
+      ok: true, seenAt: at,
+      digest: seen.digest((cache && cache.issues) || [], at, m && m.login),
+      message: 'Caught up',
+    };
+  }),
+
   'POST /api/ai/ignore': async (_q, body) => withRepo(() => {
     const slug = repos.selected.github || repos.selected.name;
     const title = String(body.title || '').trim();
@@ -1380,10 +1446,12 @@ const routes = {
     // Mutes apply to the freshly generated plan too, or a regenerate would visibly undo every
     // hide the reader had made — the one thing "survives regeneration" has to mean.
     const plan = planOps.hydratePlan(saved, m.milestones, cache.issues, muted);
+    const depsClosed = closedDepDrops(depsRejected);
     return {
-      ok: true, plan, planStatus: planStatus(slug, cache.issues),
+      ok: true, plan, planStatus: planStatus(slug, cache.issues), depsClosed,
       message: `${revising ? 'Updated' : 'Built'} a ${plan.ranked.length}-step plan with ${gaps.length} missing-work insight${gaps.length === 1 ? '' : 's'}` +
-        (deps.length ? ` and ${deps.length} dependenc${deps.length === 1 ? 'y' : 'ies'}` : '') + ' ' +
+        (deps.length ? ` and ${deps.length} dependenc${deps.length === 1 ? 'y' : 'ies'}` : '') +
+        (depsClosed ? ` (${depsClosed} more named closed issues and were ignored)` : '') + ' ' +
         (scope
           ? `for ${planOps.scopeText(scope)}`
           : `from ${phases.length} milestone${phases.length === 1 ? '' : 's'}`) +
@@ -1448,13 +1516,15 @@ const routes = {
     // Classification proposes edges too, and a refusal made in the Plan view has to hold here
     // as well — otherwise the same rejected dependency reappears under a different button.
     const deps = dropRefusedDeps(out.deps, rejectedDeps(repos.selected.github || repos.selected.name));
+    const depsClosed = closedDepDrops(out.depsRejected);
     const n = proposals.filter(p => p.changed).length;
     const nominated = newMilestones.length + newLabels.length;
     return {
-      ok: true, proposals, newMilestones, newLabels, deps, retrieved,
+      ok: true, proposals, newMilestones, newLabels, deps, depsClosed, retrieved,
       message: `Classified ${pick.length} issue${pick.length === 1 ? '' : 's'} in ${((Date.now() - t0) / 1000).toFixed(0)}s — ${n} suggested change${n === 1 ? '' : 's'}` +
         (nominated ? ` · nominated ${nominated} new categor${nominated === 1 ? 'y' : 'ies'}` : '') +
         (deps.length ? ` · found ${deps.length} dependenc${deps.length === 1 ? 'y' : 'ies'}` : '') +
+        (depsClosed ? ` · ignored ${depsClosed} naming closed issues` : '') +
         (retrieved ? ` · used ${corpus.length} similar issues as precedent` : ''),
     };
   })),

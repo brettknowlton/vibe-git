@@ -17,12 +17,16 @@ const BOOT = window.__VIBE_GIT__ || {};
  *
  * Must match API_VERSION in server.js. Bump both together when routes change.
  */
-const APP_API = 7;
+const APP_API = 9;
 const staleServer = () => Number(BOOT.api || 0) !== APP_API;
 let S = null;                 // last server state
 let VIEW = 'issues';
 let SEL = { issue: null, file: null, commit: null };
-const FILTER = { phase: null, milestone: null, label: null, q: '', state: 'open', un: false, ready: false };
+const FILTER = {
+  phase: null, milestone: null, label: null, q: '', state: 'open', un: false, ready: false,
+  // A login, or the literal '__me__' — resolved late so it survives a change of gh account.
+  assignee: null,
+};
 
 /*
  * Search is a layer over the filter, not a replacement for it. When it has hits they
@@ -325,6 +329,14 @@ function resetRepoUi() {
   // it over would reject the next plan request as an unknown milestone.
   planScope = { milestone: null, label: null };
   FILTER.label = null;
+  FILTER.assignee = null;
+  // A draft belongs to the tracker it was written for, and its milestone, labels and
+  // assignees would all be wrong in the next one. The templates likewise come from a
+  // particular working tree.
+  issueDraft = null;
+  TEMPLATES = null; templatesFor = null;
+  HISTORY_MODE = 'commits';
+  digestOff = false;
 }
 
 /* Coarse on purpose: the question a cached list raises is "roughly how stale", not "when". */
@@ -340,10 +352,29 @@ function ago(iso) {
   return days + 'd ago';
 }
 
+/*
+ * How old the issue list is, said plainly rather than as a clock time.
+ *
+ * "issues 14:32" is a fact you have to do arithmetic on, and the arithmetic is easy to skip —
+ * so a list pulled yesterday read exactly like one pulled a minute ago, and every view in
+ * the app rests on it being current. Past the threshold it says the age instead and turns
+ * warn-coloured, because at that point the number IS the news.
+ */
+const STALE_AFTER_MIN = 90;
+
 function stampNow() {
-  $('stamp').textContent = S && S.issuesAt
-    ? 'issues ' + new Date(S.issuesAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : '';
+  const el = $('stamp');
+  if (!el) return;
+  if (!S || !S.issuesAt) { el.textContent = ''; el.className = 'lab'; el.title = ''; return; }
+  const mins = Math.max(0, Math.round((Date.now() - new Date(S.issuesAt)) / 60000));
+  const stale = mins >= STALE_AFTER_MIN;
+  const clock = new Date(S.issuesAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  el.textContent = stale ? 'issues ' + ago(S.issuesAt) : 'issues ' + clock;
+  el.className = 'lab' + (stale ? ' stale' : '');
+  el.title = stale
+    ? 'The issue list was pulled at ' + clock + '. Everything in the Issues and Plan views is ' +
+      'that old, including what looks closed and what looks ready. Pull issues to refresh it.'
+    : 'Issue list pulled at ' + clock;
 }
 
 /* The only path that fetches issues. Everything else works from what's already loaded. */
@@ -462,6 +493,51 @@ function renderSide() {
   if (VIEW === 'staged') return sideStaged(body, foot);
 }
 
+/* Who this machine's gh is signed in as. Everything "mine" hangs off this one value, and it
+   can legitimately be absent — an unauthenticated gh still reads a public tracker. */
+const myLogin = () => (S && S.github && S.github.login) || (S && S.auth && S.auth.login) || null;
+
+function assignedToMe(issue) {
+  const me = myLogin();
+  return !!me && (issue.a || []).some(a => a.toLowerCase() === me.toLowerCase());
+}
+
+/*
+ * Is somebody waiting on ME?
+ *
+ * The signal is SOMETHING WAS SAID that you may not have seen — never assignment on its own.
+ * That distinction is the whole difference between a useful marker and a decoration: on a
+ * solo tracker, or any repository with one maintainer, you are assigned to everything, so a
+ * flag that fires on assignment fires on every row and stops carrying information. Measured
+ * on a real 55-issue tracker where it lit up all 55.
+ *
+ * So both cases require a comment by someone else: a reply after you last spoke, or
+ * discussion on an issue that is yours. GitHub answers this with a notifications inbox this
+ * app has no access to, so it is reconstructed from comment authors — and only from the
+ * comments a pull kept, which is why it says "worth a look" and never "unread".
+ */
+function needsMe(issue) {
+  const me = myLogin();
+  if (!me || issue.st !== 'OPEN') return null;
+  const low = me.toLowerCase();
+  const thread = issue.cm || [];
+  if (!thread.length) return null;
+  const authors = thread.map(c => String(c.who || '').toLowerCase());
+  const mineIdx = authors.lastIndexOf(low);
+  if (mineIdx >= 0) {
+    const after = thread.length - 1 - mineIdx;
+    // Replies after your own last word, by anybody but you.
+    const others = authors.slice(mineIdx + 1).filter(a => a !== low).length;
+    if (after > 0 && others > 0) {
+      return others === 1 ? 'someone replied after your comment' : others + ' replies since your comment';
+    }
+    return null;
+  }
+  if (!assignedToMe(issue)) return null;
+  const others = authors.filter(a => a !== low).length;
+  return others ? 'assigned to you, ' + others + ' comment' + (others === 1 ? '' : 's') + ' you have not answered' : null;
+}
+
 function visibleIssues() {
   const ranked = SEARCH.hits && SEARCH.q === FILTER.q ? SEARCH.hits : null;
   const readySet = FILTER.ready && DEPS ? new Set(DEPS.ready) : null;
@@ -474,6 +550,10 @@ function visibleIssues() {
     if (FILTER.label === '__none__' && i.l.length) return false;
     if (FILTER.label && FILTER.label !== '__none__' && !i.l.includes(FILTER.label)) return false;
     if (FILTER.un && i.a.length) return false;
+    /* "__me__" resolves at filter time rather than being stored as a login, so the filter
+       keeps meaning the right thing if the machine's gh account changes under it. */
+    if (FILTER.assignee === '__me__' && !assignedToMe(i)) return false;
+    if (FILTER.assignee && FILTER.assignee !== '__me__' && !i.a.includes(FILTER.assignee)) return false;
     if (readySet && !readySet.has(i.n)) return false;
     if (!FILTER.q) return true;
     // With search results in hand, membership is the search's call; otherwise substring.
@@ -524,6 +604,41 @@ async function loadDeps() {
   if (!S || !S.issuesLoaded) return;
   try { DEPS = await api('/api/issues/dependencies'); }
   catch { DEPS = null; }
+}
+
+/*
+ * Pull, file, push — the three issue actions, wherever issues are being worked on.
+ *
+ * These used to belong to the Issues view alone, which was wrong the moment the Plan view
+ * grew buttons that stage things. Reading the plan is where you decide what is finished, so
+ * it is where closes get staged — and then the only way to apply them was to leave for
+ * another view, whose sidebar looks nothing like the one you were reading. Same three
+ * buttons, one definition, so the two can never drift apart.
+ *
+ * `+ New issue` sets the view as well as the selection: from the Plan view, selecting the
+ * draft without switching would leave you looking at the plan wondering what the button did.
+ */
+function issueActions(foot) {
+  const staged = S.queue.length;
+  foot.append(h('div', { style: { display: 'flex', gap: '7px' } },
+    h('button', {
+      class: 'btn wide', disabled: pulling || !S.selected.github,
+      title: 'Re-read every issue, milestone and label from GitHub. Nothing staged is lost.',
+      onclick: () => pullIssues(),
+    }, pulling ? 'Pulling…' : 'Pull issues'),
+    h('button', {
+      class: 'btn primary wide', title: 'Draft a new issue. It is staged, not filed.',
+      onclick: () => { VIEW = 'issues'; SEL.issue = 'new'; render(); },
+    }, '+ New issue')));
+  foot.append(h('button', {
+    class: 'btn wide' + (staged ? ' primary' : ''), disabled: !staged,
+    title: staged
+      ? 'Apply every staged issue change to GitHub. Review them in the Staged view first.'
+      : 'Nothing is waiting to be pushed.',
+    onclick: () => act(() => api('/api/queue/push', {}), 'queue'),
+  }, staged
+      ? (S.dryRun ? 'Dry-run push ' : 'Push ') + staged + ' issue change' + (staged === 1 ? '' : 's')
+      : 'No issue changes staged'));
 }
 
 function sideIssues(body, foot) {
@@ -595,12 +710,45 @@ function sideIssues(body, foot) {
         });
         return sel;
       })(),
+      /*
+       * Who it belongs to. On any repository with more than one person this is the most-used
+       * filter on github.com, and the app had only an Unassigned toggle — so "what is on my
+       * plate" was the one question the issue list could not answer.
+       *
+       * Built from assignees actually present on the loaded issues, for the same reason the
+       * label dropdown is: a repository can have far more collaborators than contributors,
+       * and forty names that select nothing is worse than no dropdown.
+       */
+      (() => {
+        const me = myLogin();
+        const used = new Map();
+        S.issues.forEach(i => i.a.forEach(a => used.set(a, (used.get(a) || 0) + 1)));
+        const names = [...used.keys()].sort((a, b) => a.localeCompare(b));
+        if (!names.length) return null;
+        const sel = h('select', { title: 'Filter by assignee', style: { flex: '1 1 100%' } },
+          h('option', { value: '', selected: !FILTER.assignee }, 'Anyone assigned'),
+          me && used.has(me)
+            ? h('option', { value: '__me__', selected: FILTER.assignee === '__me__' },
+              'Assigned to me  (' + used.get(me) + ')')
+            : null,
+          ...names.map(n => h('option', {
+            value: n, selected: FILTER.assignee === n,
+          }, n + '  (' + used.get(n) + ')')));
+        sel.addEventListener('change', () => {
+          FILTER.assignee = sel.value || null;
+          // Two ways of saying "nobody" that contradict each other; the newer choice wins.
+          if (FILTER.assignee) FILTER.un = false;
+          renderSide();
+        });
+        return sel;
+      })(),
       (() => {
         const b = h('button', { class: 'btn sm', 'aria-pressed': String(FILTER.un) }, 'Unassigned');
         b.addEventListener('click', () => {
           FILTER.un = !FILTER.un;
+          if (FILTER.un) FILTER.assignee = null;
           b.setAttribute('aria-pressed', String(FILTER.un));
-          renderIssueList();
+          renderSide();
         });
         return b;
       })(),
@@ -625,17 +773,7 @@ function sideIssues(body, foot) {
   const list = h('div', { id: 'issue-list' });
   body.append(list);
 
-  const staged = S.queue.length;
-  foot.append(h('div', { style: { display: 'flex', gap: '7px' } },
-    h('button', { class: 'btn wide', disabled: pulling || !S.selected.github, onclick: () => pullIssues() },
-      pulling ? 'Pulling…' : 'Pull issues'),
-    h('button', { class: 'btn primary wide', onclick: () => { SEL.issue = 'new'; renderPane(); } }, '+ New issue')));
-  foot.append(h('button', {
-    class: 'btn wide' + (staged ? ' primary' : ''), disabled: !staged,
-    onclick: () => act(() => api('/api/queue/push', {}), 'queue'),
-  }, staged
-      ? (S.dryRun ? 'Dry-run push ' : 'Push ') + staged + ' issue change' + (staged === 1 ? '' : 's')
-      : 'No issue changes staged'));
+  issueActions(foot);
   foot.append(h('span', { class: 'lab', id: 'issue-count' }, ''));
   // Last, not before the footer is built: renderIssueList writes into #issue-count, and
   // running it first meant the count line stayed blank until some later re-render
@@ -678,6 +816,14 @@ function renderIssueList() {
       h('span', { class: 'meta' },
         hit && hit.why === 'similar meaning'
           ? h('span', { class: 'why-chip', title: 'matched by meaning, not words' }, '≈') : null,
+        /* "Is anyone waiting on me" without reading every thread. Reconstructed from the
+           comments the pull kept, so it can miss — never a claim, only a prompt to look. */
+        (() => {
+          const why = needsMe(i);
+          return why
+            ? h('span', { class: 'why-chip mine', title: 'Worth a look — ' + why }, '◆')
+            : null;
+        })(),
         waits && waits.length ? h('span', { class: 'why-chip blocked', title: 'blocked' }, '⛔') : null,
         stagedFor.has(i.n) ? h('span', { class: 'staged-pip', title: 'has staged changes' }) : null,
         i.p != null ? h('span', { class: 'dot', style: { '--c': pc(i.p) }, title: i.ms }) : null)));
@@ -813,7 +959,12 @@ function renderBulkBar() {
 
 function sidePlan(body, foot) {
   const ins = S.insights;
-  if (!ins) return body.append(h('div', { class: 'empty' }, 'No plan is available for this repository.'));
+  // No plan yet is exactly when you are most likely to be pulling issues to build one from,
+  // so the actions come before the early return rather than after it.
+  if (!ins) {
+    body.append(h('div', { class: 'empty' }, 'No plan is available for this repository.'));
+    return issueActions(foot);
+  }
   body.append(h('div', { style: { padding: '11px' } },
     h('span', { class: 'lab' }, 'Milestones'),
     h('div', { style: { display: 'flex', flexDirection: 'column', gap: '3px', marginTop: '7px' } },
@@ -826,7 +977,95 @@ function sidePlan(body, foot) {
           FILTER.phase === p.n ? { background: 'var(--fill)', color: 'var(--fill-fg)' } : {}),
         onclick: () => { FILTER.phase = FILTER.phase === p.n ? null : p.n; render(); },
       }, p.name)))));
+  put(body, milestoneEditor());
+  // The plan view stages closes as you read it, so it gets the same three buttons the Issues
+  // view has rather than sending you to another view to apply what you just decided.
+  issueActions(foot);
   foot.append(h('span', { class: 'lab' }, ins.source));
+}
+
+/*
+ * Editing the milestones the whole Plan view is built out of.
+ *
+ * Titles, descriptions and due dates decide the phase bands, the ordering, and what the
+ * model is told each milestone is FOR — and every one of them was previously editable only
+ * on github.com. You could create a milestone here and then never correct it, which is the
+ * wrong half of the operation to support.
+ *
+ * It lives in the Plan sidebar rather than in a settings screen because that is where the
+ * consequences are visible: change a due date and the band it drives is on the same page.
+ * Staged like everything else, so a rename can be reviewed and dropped before it lands.
+ */
+function milestoneEditor() {
+  const all = (S.github && S.github.milestones) || [];
+  if (!all.length) return null;
+  const counts = new Map();
+  (S.issues || []).forEach(i => { if (i.ms) counts.set(i.ms, (counts.get(i.ms) || 0) + 1); });
+
+  const box = h('div', { style: { padding: '11px', borderTop: '1px solid var(--line-soft)' } },
+    h('span', { class: 'lab' }, 'Edit milestones'),
+    h('div', { class: 'lab', style: { marginBottom: '7px', textTransform: 'none', letterSpacing: '0' } },
+      'Staged like any other change — nothing moves until you push.'));
+
+  all.forEach(m => {
+    const staged = (S.queue || []).some(c => c.kind === 'milestoneEdit' && c.payload.number === m.number);
+    box.append(h('button', {
+      class: 'btn wide', disabled: staged,
+      style: { justifyContent: 'flex-start', marginBottom: '3px' },
+      title: staged ? 'An edit to this milestone is already staged'
+        : [m.description || 'No description.',
+          m.dueOn ? 'Due ' + String(m.dueOn).slice(0, 10) : 'No due date.',
+          (counts.get(m.title) || 0) + ' issues'].join('\n'),
+      onclick: (e) => openMilestoneEditor(e.currentTarget, m),
+    }, (m.state === 'closed' ? '✓ ' : '') + m.title +
+      (m.dueOn ? '  · ' + String(m.dueOn).slice(0, 10) : '')));
+  });
+  return box;
+}
+
+function openMilestoneEditor(btn, m) {
+  popover(btn, 'Milestone: ' + m.title, (body) => {
+    const title = h('input', { type: 'text', value: m.title });
+    const desc = h('textarea', { style: { minHeight: '80px' } });
+    desc.value = m.description || '';
+    const due = h('input', { type: 'date', value: m.dueOn ? String(m.dueOn).slice(0, 10) : '' });
+    const closed = m.state === 'closed';
+
+    const send = (extra) => {
+      closePop();
+      stage('milestoneEdit', Object.assign({ number: m.number }, extra));
+    };
+
+    body.append(
+      h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Title'), title),
+      h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Description'), desc,
+        h('span', { class: 'lab', style: { textTransform: 'none', letterSpacing: '0' } },
+          'The plan generator reads this to decide what belongs here, so say what "done" means.')),
+      h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Due date'), due),
+      h('div', { class: 'acts' },
+        h('button', {
+          class: 'btn sm primary',
+          onclick: () => {
+            const patch = {};
+            if (title.value.trim() && title.value.trim() !== m.title) patch.title = title.value.trim();
+            if (desc.value !== (m.description || '')) patch.description = desc.value;
+            const d = due.value || null;
+            const was = m.dueOn ? String(m.dueOn).slice(0, 10) : null;
+            // undefined means "leave it"; null means "clear it". They are different edits.
+            if (d !== was) patch.dueOn = d;
+            if (!Object.keys(patch).length) { closePop(); return toast('Nothing changed', ''); }
+            send(patch);
+          },
+        }, 'Stage changes'),
+        h('button', {
+          class: 'btn sm',
+          title: closed
+            ? 'Reopen it. A closed milestone is folded out of the plan header.'
+            : 'Close the milestone itself. This does NOT close its issues.',
+          onclick: () => send({ state: closed ? 'open' : 'closed' }),
+        }, closed ? 'Stage reopen' : 'Stage close'),
+        h('button', { class: 'btn sm', onclick: () => closePop() }, 'Cancel')));
+  });
 }
 
 /*
@@ -963,7 +1202,96 @@ function sideChanges(body, foot) {
   }
 }
 
+/*
+ * A repository has two histories and they answer different questions.
+ *
+ * The commit log says what the CODE did. It is the only history most Git clients show, and on
+ * its own it cannot tell you when a piece of work was agreed, argued about, or abandoned —
+ * a decision taken in an issue thread and never written into a commit message leaves no trace
+ * in it at all. The tracker holds that half: when each issue was filed, when it was closed,
+ * and every comment in between.
+ *
+ * Both are already in memory — the log from git, the issue timeline from the pull — so this
+ * is a switch between two readings of what is there, not a second fetch.
+ */
+let HISTORY_MODE = 'commits';
+
+function setHistoryMode(mode) {
+  if (HISTORY_MODE === mode) return;
+  HISTORY_MODE = mode;
+  // A commit selected under one reading has no meaning under the other, and leaving it set
+  // would open the issue timeline on a commit diff.
+  SEL.commit = null;
+  render();
+}
+
+function historySwitch() {
+  const tab = (mode, label, hint) => h('button', {
+    class: 'btn sm', 'aria-pressed': String(HISTORY_MODE === mode), title: hint,
+    style: { flex: '1 1 0' },
+    onclick: () => setHistoryMode(mode),
+  }, label);
+  return h('div', {
+    style: { display: 'flex', gap: '6px', padding: '10px 11px', borderBottom: '1px solid var(--line-soft)' },
+  },
+    tab('commits', 'Commits', 'What the code did: commits on this branch, newest first, each with its full diff.'),
+    tab('issues', 'Issue activity', 'What the tracker did: every issue opened, closed and commented on, newest first. Read from the last pull, so it is as current as your issue list.'));
+}
+
+/*
+ * The tracker's timeline, assembled from what a pull already stores.
+ *
+ * Three event kinds, because three are what the cached fields can support honestly: an issue
+ * was filed, an issue was closed, somebody said something. Label changes, reassignments and
+ * reopens are real events too and are NOT here — they live only in GitHub's timeline API,
+ * which a pull does not fetch, and inventing them from `updatedAt` would produce a history
+ * that looks complete and is wrong.
+ */
+function issueEvents(limit = 400) {
+  const out = [];
+  for (const i of S.issues || []) {
+    if (i.createdAt) out.push({ at: i.createdAt, kind: 'opened', n: i.n, t: i.t, who: null });
+    if (i.closedAt) out.push({ at: i.closedAt, kind: 'closed', n: i.n, t: i.t, who: null });
+    for (const c of i.cm || []) {
+      if (c.at) out.push({ at: c.at, kind: 'commented', n: i.n, t: i.t, who: c.who, body: c.body });
+    }
+  }
+  out.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
+  return { events: out.slice(0, limit), total: out.length };
+}
+
+const EVENT_WORD = { opened: 'filed', closed: 'closed', commented: 'comment on' };
+
 function sideHistory(body, foot) {
+  body.append(historySwitch());
+
+  if (HISTORY_MODE === 'issues') {
+    if (!S.issuesLoaded) {
+      body.append(h('div', { class: 'empty' }, 'Pull issues to see what the tracker has been doing.'));
+      return foot.append(h('span', { class: 'lab' }, 'no issues loaded'));
+    }
+    const { events, total } = issueEvents();
+    if (!events.length) {
+      body.append(h('div', { class: 'empty' }, 'No issue activity recorded.'));
+      return foot.append(h('span', { class: 'lab' }, '0 events'));
+    }
+    events.forEach(e => body.append(h('div', {
+      class: 'irow', style: { gridTemplateColumns: '1fr' },
+      title: e.kind === 'commented' && e.body ? e.body.slice(0, 300) : e.t,
+      onclick: () => { VIEW = 'issues'; SEL.issue = e.n; render(); },
+    },
+      h('span', { class: 't' }, '#' + e.n + ' ' + e.t,
+        h('span', { class: 'sub' },
+          EVENT_WORD[e.kind] + (e.who ? ' by ' + e.who : '') + ' · ' + ago(e.at))))));
+    // Say what is not shown. A truncated list that looks whole is the one failure a history
+    // view cannot recover from.
+    foot.append(h('span', { class: 'lab' },
+      events.length < total
+        ? 'newest ' + events.length + ' of ' + total + ' events'
+        : total + ' events'));
+    return;
+  }
+
   const log = S.git ? S.git.log : [];
   if (!log.length) return body.append(h('div', { class: 'empty' }, 'No commits.'));
   log.forEach(c => body.append(h('div', {
@@ -1004,9 +1332,12 @@ function renderPane() {
   if (!S.selected) {
     return p.append(h('div', { class: 'empty' }, 'No repository selected. Pick one from the top-left.'));
   }
+  // Nothing that talks to GitHub works without a usable gh, so this outranks every view.
+  put(p, ghHealthBanner());
   if (S.githubError && (VIEW === 'issues' || VIEW === 'plan')) {
     p.append(h('div', { class: 'banner' }, h('b', {}, 'GitHub unavailable. '), S.githubError));
   }
+  if (VIEW === 'issues' || VIEW === 'plan') put(p, digestBanner());
   if (S.truncated) {
     p.append(h('div', { class: 'banner warn' }, h('b', {}, 'Issue list truncated. '),
       'This repo has more issues than the fetch limit, so counts below are partial.'));
@@ -1018,6 +1349,87 @@ function renderPane() {
   if (VIEW === 'history') return paneHistory(p);
   if (VIEW === 'prs') return panePrs(p);
   if (VIEW === 'staged') return paneStaged(p);
+}
+
+/*
+ * The GitHub CLI, before it is needed rather than after.
+ *
+ * A missing gh, a gh from before 2.54, and a gh nobody is signed in to are three different
+ * problems with three different fixes, and all three used to arrive identically: as whatever
+ * stderr said, in a toast, in the middle of an action the user had already committed to.
+ * Somebody evaluating this app for the first time could not tell a broken install from a
+ * broken app. Git itself keeps working throughout, which is worth saying out loud — half
+ * the app is still usable.
+ */
+function ghHealthBanner() {
+  const gh = S && S.ghHealth;
+  if (!gh || !gh.problem) return null;
+  return h('div', { class: 'banner warn' },
+    h('b', {}, gh.installed ? 'The GitHub CLI is out of date. ' : 'The GitHub CLI is missing. '),
+    gh.problem, ' ',
+    gh.fix ? h('b', {}, gh.fix) : null,
+    h('br'),
+    h('span', { class: 'lab' },
+      'The Changes, History and Conflicts views work without it — they are Git, not GitHub.'));
+}
+
+/*
+ * What happened here while you were away.
+ *
+ * The tracker moves whether or not you are looking at it, and until now nothing said so: you
+ * pulled, and a list that had changed under you looked exactly like one that had not. This
+ * is the same reasoning the Plan view already does about its own staleness, pointed at the
+ * issue list — and it is deliberately counts and a jump, not a feed, because the History
+ * view's issue timeline is the feed and duplicating it here would be two of the same thing.
+ *
+ * Your own actions are excluded server-side. Being told about the issue you closed two
+ * minutes ago is noise, and noise is how a surface like this gets ignored permanently.
+ */
+let digestOff = false;
+
+function digestBanner() {
+  const d = S && S.digest;
+  if (digestOff || !d || !d.total) return null;
+  const bits = [];
+  if (d.filed.length) bits.push(d.filed.length + ' filed');
+  if (d.closed.length) bits.push(d.closed.length + ' closed');
+  if (d.commented.length) bits.push('comments on ' + d.commented.length);
+  const box = h('div', { class: 'banner' },
+    h('b', {}, 'Since you last caught up: '), bits.join(', '), '. ',
+    d.mine.length
+      ? h('b', {}, d.mine.length === 1
+        ? '1 of them is on an issue you are part of. '
+        : d.mine.length + ' are on issues you are part of. ')
+      : null,
+    h('span', { class: 'lab' }, 'as of your last pull, ' + (S.issuesAt ? ago(S.issuesAt) : 'unknown')));
+  const acts = h('div', { class: 'acts', style: { marginTop: '7px' } });
+  acts.append(h('button', {
+    class: 'btn sm', title: 'Open the issue timeline in the History view',
+    onclick: () => { VIEW = 'history'; setHistoryMode('issues'); },
+  }, 'See what changed'));
+  if (d.mine.length) {
+    acts.append(h('button', {
+      class: 'btn sm', title: 'Show only the issues you are assigned to or have commented on',
+      onclick: () => { VIEW = 'issues'; SEL.issue = d.mine[0]; render(); },
+    }, 'Open #' + d.mine[0]));
+  }
+  acts.append(h('button', {
+    class: 'btn sm primary',
+    title: 'Mark everything up to now as read. Nothing is changed on GitHub.',
+    onclick: async () => {
+      try {
+        const r = await api('/api/issues/seen', {});
+        S.seenAt = r.seenAt; S.digest = r.digest;
+        renderPane();
+      } catch (e) { toast(e.message, 'bad'); }
+    },
+  }, 'Mark as caught up'));
+  acts.append(h('button', {
+    class: 'btn sm', title: 'Hide this until the next time the page loads',
+    onclick: () => { digestOff = true; renderPane(); },
+  }, 'Not now'));
+  box.append(acts);
+  return box;
 }
 
 /* ── issue detail + editor ───────────────────────────────────────── */
@@ -1110,6 +1522,12 @@ function paneIssue(p) {
       }, l.name);
     }))));
 
+  wrap.append(h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Body'),
+    h('div', { class: 'body-md' }, i.body || '(empty)')));
+
+  // put(), not append(): the thread declines to build anything when there is no discussion.
+  put(wrap, commentThread(i));
+
   const cmt = h('textarea', { placeholder: 'Write a comment…' });
   wrap.append(h('div', { class: 'field' }, h('span', { class: 'lab' }, 'New comment'), cmt,
     h('button', {
@@ -1120,9 +1538,6 @@ function paneIssue(p) {
         stage('comment', { number: i.n, body: v }).then(() => { cmt.value = ''; });
       },
     }, 'Stage comment')));
-
-  wrap.append(h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Body'),
-    h('div', { class: 'body-md' }, i.body || '(empty)')));
 
   /* Dependency context, straight from the reference edges the pull now keeps. */
   const waiting = (i.bk || []).filter(n => S.issues.some(x => x.n === n && x.st === 'OPEN'));
@@ -1167,6 +1582,63 @@ function paneIssue(p) {
   wrap.append(relatedBox);
   p.append(wrap);
   loadRelated(i.n, relatedBox);
+}
+
+/*
+ * The discussion, which used to be a number.
+ *
+ * The detail view showed a body and a comment count, and the count is the least useful part
+ * of a thread: an issue whose body describes one plan and whose comments abandoned it reads
+ * as current, and every decision taken after filing was invisible without opening github.com.
+ * That is the context this view was missing — most of these threads are one reply long and
+ * that one reply is usually the whole answer.
+ *
+ * Bodies are inserted as TEXT, never markup. These are other people's words arriving through
+ * an API, held to the same rule as the issue body above them.
+ */
+function commentThread(i) {
+  const thread = Array.isArray(i.cm) ? i.cm : null;
+  const total = Number(i.comments) || 0;
+  // Staged comments have not been pushed, so they belong to the thread visually but must never
+  // be mistaken for something the other person can already see.
+  const pending = (S.queue || []).filter(c => c.kind === 'comment' && c.payload &&
+    c.payload.number === i.n && c.payload.body);
+  if (!total && !pending.length) return null;
+
+  const field = h('div', { class: 'field' },
+    h('span', { class: 'lab' },
+      'Comments' + (total ? ' (' + total + ')' : '')));
+
+  /* An issue cached before comments were kept has a count and no thread. Saying which is
+     honest; rendering an empty thread would claim the discussion was empty. */
+  if (thread == null) {
+    field.append(h('div', { class: 'lab' },
+      'Pull issues to load ' + (total === 1 ? 'the comment' : 'these ' + total + ' comments') + '.'));
+  } else {
+    if (total > thread.length) {
+      field.append(h('div', { class: 'lab' },
+        'showing the ' + thread.length + ' most recent · ' +
+        (total - thread.length) + ' older on GitHub'));
+    }
+    const box = h('div', { class: 'comments' });
+    thread.forEach(c => box.append(h('div', { class: 'cmt' },
+      h('div', { class: 'cmt-h' },
+        h('span', { class: 'who' }, c.who ? '@' + c.who : 'unknown'),
+        c.at ? h('span', { class: 'lab', title: c.at }, ago(c.at)) : null,
+        c.url ? h('a', {
+          class: 'lab', href: c.url, target: '_blank', rel: 'noreferrer noopener',
+          title: 'Open this comment on GitHub',
+        }, '↗') : null),
+      h('div', { class: 'body-md' }, c.body || '(empty)'))));
+    field.append(box);
+  }
+
+  pending.forEach(c => field.append(h('div', { class: 'cmt pending' },
+    h('div', { class: 'cmt-h' },
+      h('span', { class: 'who' }, 'you'),
+      h('span', { class: 'chip' }, 'staged — not pushed yet')),
+    h('div', { class: 'body-md' }, c.payload.body))));
+  return field;
 }
 
 function relHit(number, title, state, extra) {
@@ -1403,9 +1875,12 @@ function planDepProposals() {
   const refused = proposed.filter(d => d.muted);
   const outstanding = live.filter(d => {
     const issue = S.issues.find(i => i.n === d.blocked);
+    if (issue && issue.st !== 'OPEN') return false;
     const already = new Set((issue && issue.bk) || []);
     const no = new Set(d.mutedBy || []);
-    return d.blockedBy.some(n => !already.has(n) && !no.has(n));
+    // Same test depCard() applies, so the heading count and the cards below it agree about
+    // how much is actually left to decide.
+    return d.blockedBy.some(n => !already.has(n) && !no.has(n) && depOpen(n));
   });
   const wrap = h('div', { class: 'depprops' });
   wrap.append(h('div', { class: 'sec-head', style: { marginTop: '4px' } },
@@ -1554,17 +2029,48 @@ function depGraph(center, upstream, downstream) {
       overflow > 0 ? ` · ${overflow} more not drawn` : ''));
 }
 
+/*
+ * The draft, kept OUTSIDE the render.
+ *
+ * This form used to build fresh inputs on every render and hold the text nowhere else, so
+ * anything that redrew the pane — clicking a label filter, a background refresh landing, a
+ * push finishing — silently emptied a half-written issue. The chat box has had `chatDraft`
+ * for exactly this reason since it was written; the issue form, which is where the longest
+ * text in the app gets typed, had nothing.
+ *
+ * Cleared on a successful stage and on Cancel, which are the two places the user has said
+ * they are finished with it. Not cleared on navigation: leaving the form to go and read the
+ * issue you are about to duplicate is part of writing one.
+ */
+let issueDraft = null;
+
+const blankDraft = () => ({ title: '', body: '', milestone: '', labels: [], assignees: [], from: null });
+
 function paneNewIssue(p) {
   const gh = S.github || { milestones: [], labels: [], assignable: [] };
-  const title = h('input', { type: 'text', placeholder: 'Issue title' });
-  const body = h('textarea', { placeholder: 'Description (markdown)' , style: { minHeight: '190px' } });
-  const ms = h('select', {}, h('option', { value: '' }, '— no milestone —'),
-    ...gh.milestones.map(m => h('option', { value: m.title }, m.title)));
-  const labels = new Set(), assignees = new Set();
+  if (!issueDraft) issueDraft = blankDraft();
+  const d = issueDraft;
 
-  p.append(h('div', { class: 'detail pane-narrow' },
+  const title = h('input', { type: 'text', placeholder: 'Issue title', value: d.title });
+  const body = h('textarea', { placeholder: 'Description (markdown)', style: { minHeight: '190px' } });
+  body.value = d.body;
+  const ms = h('select', {}, h('option', { value: '' }, '— no milestone —'),
+    ...gh.milestones.map(m => h('option', { value: m.title, selected: m.title === d.milestone }, m.title)));
+  const labels = new Set(d.labels), assignees = new Set(d.assignees);
+
+  // Every keystroke, because the whole point is surviving a redraw nobody asked for.
+  title.addEventListener('input', () => { d.title = title.value; });
+  body.addEventListener('input', () => { d.body = body.value; });
+  ms.addEventListener('change', () => { d.milestone = ms.value; });
+  const remember = () => { d.labels = [...labels]; d.assignees = [...assignees]; };
+
+  const wrap = h('div', { class: 'detail pane-narrow' },
     h('div', { class: 'head' }, h('div', { class: 't' }, 'New issue'),
-      h('span', { class: 'lab' }, 'staged like everything else — nothing is filed until you push')),
+      h('span', { class: 'lab' }, 'staged like everything else — nothing is filed until you push')));
+
+  put(wrap, templatePicker(d, { title, body, labels, assignees, remember }));
+
+  put(wrap,
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Title'), title),
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Body'), body),
     h('div', { class: 'grid2' },
@@ -1572,19 +2078,21 @@ function paneNewIssue(p) {
       h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Assignees'),
         h('div', { class: 'picker' }, ...gh.assignable.slice(0, 24).map(w =>
           h('button', {
-            class: 'pick', 'aria-pressed': 'false',
+            class: 'pick', 'aria-pressed': String(assignees.has(w)),
             onclick: (e) => {
               assignees.has(w) ? assignees.delete(w) : assignees.add(w);
               e.currentTarget.setAttribute('aria-pressed', String(assignees.has(w)));
+              remember();
             },
           }, w))))),
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Labels'),
       h('div', { class: 'picker' }, ...gh.labels.map(l =>
         h('button', {
-          class: 'pick', 'aria-pressed': 'false',
+          class: 'pick', 'aria-pressed': String(labels.has(l.name)),
           onclick: (e) => {
             labels.has(l.name) ? labels.delete(l.name) : labels.add(l.name);
             e.currentTarget.setAttribute('aria-pressed', String(labels.has(l.name)));
+            remember();
           },
         }, l.name)))),
     h('div', { class: 'acts' },
@@ -1596,10 +2104,88 @@ function paneNewIssue(p) {
           stage('create', {
             title: t, body: body.value, milestone: ms.value || null,
             labels: [...labels], assignees: [...assignees],
-          }).then(() => { SEL.issue = null; renderPane(); });
+          }).then(() => { issueDraft = null; SEL.issue = null; renderPane(); });
         },
       }, 'Stage new issue'),
-      h('button', { class: 'btn', onclick: () => { SEL.issue = null; renderPane(); } }, 'Cancel'))));
+      h('button', {
+        class: 'btn',
+        title: 'Discard this draft and go back',
+        onclick: () => { issueDraft = null; SEL.issue = null; renderPane(); },
+      }, 'Cancel')));
+  p.append(wrap);
+}
+
+/*
+ * The repository's own issue templates.
+ *
+ * A maintainer writes a template to ask specific questions, and an issue filed without it
+ * skips every one of them. vibe-git used to offer a blank box regardless, which made filing
+ * through this app strictly worse than filing on github.com for any repository that has
+ * them — the one comparison it must never lose.
+ *
+ * Fetched once per repository and cached, because most repositories have none and asking
+ * again on every render would be a filesystem walk per keystroke-triggered redraw.
+ */
+let TEMPLATES = null;            // { issue: [], pr: [] } once fetched
+let templatesFor = null;         // which repo path the cache belongs to
+
+async function loadTemplates() {
+  const path = S && S.selected && S.selected.path;
+  if (!path) return null;
+  if (templatesFor === path && TEMPLATES) return TEMPLATES;
+  try {
+    const r = await api('/api/templates');
+    TEMPLATES = { issue: r.issue || [], pr: r.pr || [] };
+    templatesFor = path;
+  } catch { TEMPLATES = { issue: [], pr: [] }; templatesFor = path; }
+  return TEMPLATES;
+}
+
+function applyTemplate(t, d, ui) {
+  // Never overwrite text somebody has already typed — a template is a starting point, and
+  // clobbering a half-written body would be the exact failure this form just stopped having.
+  if (d.body.trim() && !confirm('Replace what you have written with the "' + t.name + '" template?')) return;
+  d.from = t.name;
+  d.body = t.body || '';
+  ui.body.value = d.body;
+  if (t.title && !d.title.trim()) { d.title = t.title; ui.title.value = t.title; }
+  // Labels and assignees are additive: the template's are what it asks for, and anything
+  // already picked was picked deliberately.
+  (t.labels || []).forEach(l => { if ((S.github.labels || []).some(x => x.name === l)) ui.labels.add(l); });
+  (t.assignees || []).forEach(a => ui.assignees.add(a));
+  ui.remember();
+  renderPane();
+}
+
+function templatePicker(d, ui) {
+  if (!TEMPLATES) { loadTemplates().then(t => { if (t && t.issue.length) renderPane(); }); return null; }
+  const list = TEMPLATES.issue;
+  if (!list.length) return null;
+
+  const box = h('div', { class: 'field' },
+    h('span', { class: 'lab' }, 'Templates this repository defines'),
+    h('div', { class: 'lab' }, d.from
+      ? 'Started from “' + d.from + '”. Picking another replaces the body.'
+      : 'Optional, but they are the questions the maintainers actually want answered.'));
+  const row = h('div', { class: 'picker' });
+  list.forEach(t => row.append(h('button', {
+    class: 'pick', 'aria-pressed': String(d.from === t.name),
+    title: [t.about, t.source, t.form ? 'An issue form — its fields become headings you fill in.' : null,
+      (t.labels || []).length ? 'adds labels: ' + t.labels.join(', ') : null]
+      .filter(Boolean).join('\n'),
+    onclick: () => applyTemplate(t, d, ui),
+  }, t.name)));
+  if (d.from) {
+    row.append(h('button', {
+      class: 'pick', title: 'Empty the body and start from nothing',
+      onclick: () => {
+        d.from = null; d.body = ''; ui.body.value = '';
+        renderPane();
+      },
+    }, 'Blank'));
+  }
+  box.append(row);
+  return box;
 }
 
 /* ── plan view (per-repo insights) ───────────────────────────────── */
@@ -1615,11 +2201,29 @@ function paneNewIssue(p) {
 async function stageDependency(dep) {
   const issue = S.issues.find(i => i.n === dep.blocked);
   if (!issue) return toast('#' + dep.blocked + ' is not in the pulled issue list', 'bad');
+  if (issue.st !== 'OPEN') return toast('#' + dep.blocked + ' is closed, so it waits on nothing', 'bad');
   const already = new Set(issue.bk || []);
-  const add = dep.blockedBy.filter(n => !already.has(n));
-  if (!add.length) return toast('#' + dep.blocked + ' already records that', '');
+  const add = dep.blockedBy.filter(n => !already.has(n) && depOpen(n));
+  if (!add.length) return toast('Nothing left to record — already declared, or the blocker is closed', '');
   const body = addBlockedByLine(issue.body, add);
   await act(() => api('/api/queue/add', { kind: 'edit', payload: { number: dep.blocked, body } }), 'queue');
+}
+
+/*
+ * Is this number still an issue that can block something?
+ *
+ * The server validates every proposed edge when it makes it and again when it reads the plan
+ * back, so nothing arrives here naming finished work. What arrives here and then GOES STALE
+ * is the other half: DEP_PROPOSALS and S.insights are held in the page across pulls, so an
+ * edge that was live when the run finished is still on screen after the pull that closed its
+ * blocker — offering to record a constraint that stopped existing thirty seconds ago.
+ *
+ * Unknown numbers are treated as blockers, not as closed: an issue missing from the list is
+ * usually a truncated fetch, and refusing to draw it would hide a real edge.
+ */
+function depOpen(n) {
+  const hit = S.issues.find(x => x.n === n);
+  return !hit || hit.st === 'OPEN';
 }
 
 /* The browser-side twin of issues.js withBlockedBy(). Kept deliberately simple and identical
@@ -1651,31 +2255,44 @@ function depCard(dep) {
   const issue = S.issues.find(i => i.n === dep.blocked);
   const already = new Set((issue && issue.bk) || []);
   const refused = new Set(dep.mutedBy || []);
-  const fresh = dep.blockedBy.filter(n => !already.has(n) && !refused.has(n));
+  // A blocker that has since been closed is dropped from the offer the same way an
+  // already-recorded one is: the constraint is satisfied, so there is nothing to write down.
+  const finished = dep.blockedBy.filter(n => !depOpen(n));
+  const settled = issue && issue.st !== 'OPEN';
+  const fresh = settled ? []
+    : dep.blockedBy.filter(n => !already.has(n) && !refused.has(n) && depOpen(n));
   const staged = (S.queue || []).some(c => c.kind === 'edit' && c.payload.number === dep.blocked &&
     typeof c.payload.body === 'string' && fresh.length &&
     fresh.every(n => new RegExp('#' + n + '\\b').test(c.payload.body)));
   const name = (n) => {
     const other = S.issues.find(x => x.n === n);
+    const done = !depOpen(n);
     const chip = h('button', {
-      class: 'chip tap' + (refused.has(n) ? ' struck' : ''),
-      title: refused.has(n) ? 'You refused this edge' : (other ? other.t : 'not in the pulled list'),
+      class: 'chip tap' + (refused.has(n) || done ? ' struck' : ''),
+      title: done ? 'Already closed — it blocks nothing'
+        : refused.has(n) ? 'You refused this edge'
+          : (other ? other.t : 'not in the pulled list'),
       onclick: () => { VIEW = 'issues'; SEL.issue = n; render(); },
     }, '#' + n + (other ? ' ' + (other.t.length > 34 ? other.t.slice(0, 34) + '…' : other.t) : ''));
     // Only worth offering per-blocker when there is a choice to make between them; with one
     // blocker the card-level button says the same thing more clearly.
-    if (fresh.length < 2 || refused.has(n)) return chip;
+    if (fresh.length < 2 || refused.has(n) || done) return chip;
     return h('span', { class: 'chipwrap' }, chip, h('button', {
       class: 'chip x', title: 'Refuse just this one — #' + dep.blocked + ' does not wait on #' + n,
       onclick: () => planMute({ kind: 'deps', blocked: dep.blocked, blockedBy: n, label: '#' + dep.blocked + ' ⇠ #' + n }),
     }, '✕'));
   };
   const card = h('div', { class: 'prop dep' + (staged || !fresh.length ? ' done' : '') + (dep.muted ? ' muted' : '') });
+  /* "recorded" and "no longer applies" both mean there is nothing to stage and mean opposite
+     things about whether the edge was ever right, so they must not share a chip. */
+  const why = dep.muted ? h('span', { class: 'chip' }, 'refused')
+    : settled ? h('span', { class: 'chip ok' }, '#' + dep.blocked + ' closed')
+      : fresh.length ? (staged ? h('span', { class: 'chip' }, 'staged') : null)
+        : finished.length && !already.size ? h('span', { class: 'chip ok' }, 'blocker already done')
+          : h('span', { class: 'chip ok' }, 'recorded');
   card.append(h('div', { class: 'h' },
     h('span', { class: 't' }, '#' + dep.blocked + ' ' + (dep.title || (issue ? issue.t : ''))),
-    dep.muted ? h('span', { class: 'chip' }, 'refused')
-      : !fresh.length ? h('span', { class: 'chip ok' }, 'recorded')
-        : staged ? h('span', { class: 'chip' }, 'staged') : null));
+    why));
   card.append(h('div', { class: 'relrow' }, h('span', { class: 'lab' }, 'waits on'), ...dep.blockedBy.map(name)));
   if (dep.why) card.append(h('div', { class: 'why' }, dep.why));
 
@@ -2225,6 +2842,7 @@ async function paneDiff(p) {
 }
 
 async function paneHistory(p) {
+  if (HISTORY_MODE === 'issues') return paneIssueHistory(p);
   if (!SEL.commit) {
     const log = S.git ? S.git.log : [];
     const list = h('div', { class: 'commits' });
@@ -2386,6 +3004,7 @@ let RAIL_TAB = 'run';          // 'run' | 'chat' | 'settings'
 let MILESTONES = [];           // proposed new milestones
 let NEW_LABELS = [];           // labels the classifier nominated
 let DEP_PROPOSALS = [];        // blocking relationships the classifier spotted
+let DEP_DROPPED = 0;           // ...and how many it proposed against already-closed issues
 let DUPES = [];                // near-duplicate clusters awaiting a decision
 let DUPE_SCALE = null;         // this repo's similarity distribution, for honest labelling
 let dupeClosed = true;         // a duplicate of a CLOSED issue is the most useful kind
@@ -2603,6 +3222,8 @@ function railChat(body, foot, cfg) {
       : h('button', { class: 'btn sm primary', onclick: () => sendChat() }, 'Send'),
     h('button', {
       class: 'btn sm', disabled: !CHAT.length || chatBusy,
+      title: 'End the conversation and discard the transcript, including any proposal cards ' +
+        'below it that you have not staged. Nothing already staged is affected.',
       onclick: () => { CHAT = []; CHAT_TRACE = new Map(); CHAT_PROPOSALS = []; renderRail(); },
     }, 'Clear'),
     h('span', { class: 'lab' }, 'enter sends')));
@@ -2870,16 +3491,40 @@ function railRun(body, foot, cfg) {
 
   const unclassified = S && S.issues ? S.issues.filter(i => i.st === 'OPEN' && !i.ms).length : 0;
   const ready = !aiBusy && S && S.issuesLoaded;
+  /*
+   * Every button here spends minutes of model time and they are told apart by four words
+   * each. "Suggest missing issues" and "Suggest milestones" in particular read as the same
+   * button twice, and the difference — one invents work, the other invents categories — is
+   * exactly what you want to know before pressing either. So each says what it reads, what
+   * it produces, and what it costs.
+   */
   const acts = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
-    h('button', { class: 'btn wide primary', disabled: !ready, onclick: () => runClassify(false) },
-      aiBusy ? h('span', { class: 'spin' }) : null, 'Classify ' + unclassified + ' unassigned'),
-    h('button', { class: 'btn wide', disabled: !ready, onclick: () => runClassify(true) }, 'Re-check all open'),
-    h('button', { class: 'btn wide', disabled: aiBusy, onclick: () => runSuggest() }, 'Suggest missing issues'),
-    h('button', { class: 'btn wide', disabled: !ready, onclick: () => runMilestones() }, 'Suggest milestones'),
+    h('button', {
+      class: 'btn wide primary', disabled: !ready, onclick: () => runClassify(false),
+      title: 'Read every open issue that has no milestone and propose one for each, plus labels. ' +
+        'One model call per issue, so this is the slowest button here.',
+    }, aiBusy ? h('span', { class: 'spin' }) : null, 'Classify ' + unclassified + ' unassigned'),
+    h('button', {
+      class: 'btn wide', disabled: !ready, onclick: () => runClassify(true),
+      title: 'The same pass over EVERY open issue, including ones already filed under a ' +
+        'milestone — for when the milestones have changed and the old placements may be wrong.',
+    }, 'Re-check all open'),
+    h('button', {
+      class: 'btn wide', disabled: aiBusy, onclick: () => runSuggest(),
+      title: 'Propose NEW issues for work the planning document and milestones imply but the ' +
+        'tracker does not cover. Reads the repository files first so it does not propose what is built.',
+    }, 'Suggest missing issues'),
+    h('button', {
+      class: 'btn wide', disabled: !ready, onclick: () => runMilestones(),
+      title: 'Propose new MILESTONES — groupings for work the existing milestones cannot hold. ' +
+        'Files nothing and moves no issues.',
+    }, 'Suggest milestones'),
     planButtonRow(ready));
   if (cfg.embedModel) {
     acts.append(h('button', {
       class: 'btn wide', disabled: !ready,
+      title: 'Embed every issue with the embedding model so search matches meaning and the ' +
+        'duplicate finder works. Only new or edited issues are re-embedded, so re-running is cheap.',
       onclick: () => runAi(jobId => api('/api/ai/index', { jobId })),
     }, 'Build / refresh index'));
     /* Pure cosine over vectors that already exist — no inference, so it is instant. */
@@ -2923,7 +3568,7 @@ function railRun(body, foot, cfg) {
   }
 
   const nothing = !PROPOSALS.length && !SUGGESTIONS.length && !MILESTONES.length &&
-    !NEW_LABELS.length && !DUPES.length;
+    !NEW_LABELS.length && !DUPES.length && !DEP_PROPOSALS.length && !DEP_DROPPED;
 
   if (DUPES.length) {
     body.append(h('h3', {}, 'Possible duplicates'),
@@ -2938,10 +3583,20 @@ function railRun(body, foot, cfg) {
     body.append(h('h3', {}, 'Proposed milestones'));
     MILESTONES.forEach(ms => body.append(milestoneCard(ms)));
   }
-  if (DEP_PROPOSALS.length) {
+  if (DEP_PROPOSALS.length || DEP_DROPPED) {
     body.append(h('h3', {}, 'Dependencies found'),
       h('div', { class: 'lab', style: { marginBottom: '7px' } },
-        'staging one writes “Blocked by: #N” into the blocked issue’s body'));
+        DEP_PROPOSALS.length
+          ? 'staging one writes “Blocked by: #N” into the blocked issue’s body'
+          : 'nothing left to record'),
+      /* Silently dropping these read as "the model found nothing", which is a different and
+         much more flattering claim than "the model kept reaching for finished work". */
+      DEP_DROPPED
+        ? h('div', { class: 'lab', style: { marginBottom: '7px' } },
+          DEP_DROPPED + ' more ignored: ' +
+          (DEP_DROPPED === 1 ? 'a proposal that named' : 'proposals that named') +
+          ' an already-closed issue as the blocker')
+        : null);
     DEP_PROPOSALS.forEach(d => body.append(depCard(d)));
   }
   if (NEW_LABELS.length) {
@@ -3049,6 +3704,11 @@ function planButtonRow(ready) {
   const st = (S && S.planStatus) || {};
   const btn = h('button', {
     class: 'btn wide', disabled: !ready,
+    title: st.hasPlan
+      ? 'Offers a choice between updating the existing plan and starting over. ' + driftText(st)
+      : 'Rank the open issues into a recommended order with reasons, and propose the ' +
+        'dependencies and missing work behind that order. Saved locally; dates and milestones ' +
+        'still come from GitHub.',
     onclick: () => { planChoice = st.hasPlan ? !planChoice : false; if (st.hasPlan) renderRail(); else runPlan('new'); },
   }, st.hasPlan ? 'Regenerate plan…' : 'Generate plan + insights');
   return h('div', {}, h('div', { class: 'planrow' }, btn,
@@ -3374,6 +4034,7 @@ async function runClassify(includeClassified) {
   // Ordering constraints found while reading every open issue — the same pass, so they cost
   // nothing extra, and re-checking all open is exactly when they surface.
   DEP_PROPOSALS = r.deps || [];
+  DEP_DROPPED = Number(r.depsClosed) || 0;
   renderRail();
 }
 
@@ -3463,6 +4124,62 @@ function loadConflictDetail(file) {
 }
 
 /* The retry, shown in place of the thing that would not load. */
+/*
+ * The tracker's history, grouped by day.
+ *
+ * By day rather than as a flat list because the useful question is "what happened that week",
+ * and because the shape of the answer is itself information: four closes on one day and
+ * nothing for the next fortnight is a fact about the project that no per-issue view shows.
+ */
+function paneIssueHistory(p) {
+  const wrap = h('div', { class: 'pane-narrow' });
+  if (!S.issuesLoaded) {
+    wrap.append(h('div', { class: 'sec-head' }, h('h2', {}, 'Issue activity'),
+      h('p', {}, 'Nothing is loaded yet. Pull issues from the Issues view and this fills in.')));
+    return p.append(wrap);
+  }
+  const { events, total } = issueEvents();
+  const opened = events.filter(e => e.kind === 'opened').length;
+  const closed = events.filter(e => e.kind === 'closed').length;
+
+  wrap.append(h('div', { class: 'sec-head', style: { marginBottom: '12px' } },
+    h('h2', {}, 'Issue activity'),
+    h('p', {},
+      events.length
+        ? `${events.length === total ? total : 'The newest ' + events.length + ' of ' + total} ` +
+          `event${total === 1 ? '' : 's'} — ${opened} filed, ${closed} closed, ` +
+          `${events.length - opened - closed} comment${events.length - opened - closed === 1 ? '' : 's'}. ` +
+          'Read from your last pull, and limited to the comments the pull kept. ' +
+          'Label changes and reassignments are not here: GitHub keeps those in a timeline this app does not fetch.'
+        : 'No issue activity recorded.')));
+
+  if (!events.length) return p.append(wrap);
+
+  const list = h('div', { class: 'commits' });
+  let day = null;
+  for (const e of events) {
+    const stamp = new Date(e.at);
+    const key = stamp.toDateString();
+    if (key !== day) {
+      day = key;
+      list.append(h('div', { class: 'crow dayhead' },
+        h('span', { class: 'sha' }, ''),
+        h('span', { class: 's' }, stamp.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' })),
+        h('span', { class: 'w' }, ago(e.at))));
+    }
+    list.append(h('div', {
+      class: 'crow ev-' + e.kind, style: { cursor: 'pointer' },
+      onclick: () => { VIEW = 'issues'; SEL.issue = e.n; render(); },
+    },
+      h('span', { class: 'sha' }, EVENT_WORD[e.kind]),
+      h('span', { class: 's', title: e.kind === 'commented' && e.body ? e.body : e.t },
+        '#' + e.n + ' ' + e.t),
+      h('span', { class: 'w' }, e.who ? '@' + e.who : stamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))));
+  }
+  wrap.append(list);
+  p.append(wrap);
+}
+
 function conflictFailure(message, retry) {
   return h('div', { class: 'banner' },
     h('b', {}, 'Could not read the conflict. '), message,
@@ -4410,6 +5127,16 @@ function paneNewPr(p) {
   const title = h('input', { type: 'text', placeholder: 'Pull request title' });
   title.value = (S.git.log && S.git.log[0] && S.git.log[0].subject) || '';
   const body = h('textarea', { placeholder: 'Description', style: { minHeight: '150px' } });
+  /*
+   * The repository's own pull request template, prefilled.
+   *
+   * A PULL_REQUEST_TEMPLATE.md is a checklist the maintainers want ticked before they read
+   * the diff, and opening a PR from here used to skip it silently. Prefilled rather than
+   * offered as a picker because, unlike issues, almost every repository has exactly one —
+   * and a single-option chooser is a worse way of saying "here it is".
+   */
+  if (!TEMPLATES) loadTemplates().then(t => { if (t && t.pr.length) renderPane(); });
+  else if (TEMPLATES.pr.length) body.value = TEMPLATES.pr[0].body || '';
   const base = h('select', {}, ...names.map(n => h('option', { value: n, selected: n === chosen },
     n + (n === (S.github && S.github.defaultBranch) ? '  (default)' : '') +
     ((S.git.branches.remoteOnly || []).includes(n) ? '  (remote only)' : ''))));
@@ -4452,7 +5179,11 @@ function paneNewPr(p) {
   wrap.append(
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Title'), title),
     h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Merge into'), base),
-    h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Description'), body),
+    h('div', { class: 'field' }, h('span', { class: 'lab' }, 'Description'), body,
+      TEMPLATES && TEMPLATES.pr.length
+        ? h('span', { class: 'lab', style: { textTransform: 'none', letterSpacing: '0' } },
+          'Prefilled from ' + TEMPLATES.pr[0].source + ' — this repository\'s pull request template.')
+        : null),
     h('label', { class: 'acts' }, draft, h('span', { class: 'lab' }, 'Open as a draft')),
     h('div', { class: 'acts' }, submit,
       h('button', { class: 'btn', onclick: () => { SEL.pr = null; renderPane(); } }, 'Cancel')));
